@@ -641,9 +641,10 @@ def configured_key():
 
 
 def get_client():
-    key = configured_key() or st.session_state.get("manual_key", "")
+    key = configured_key()
     if not key:
-        raise RuntimeError("أدخل مفتاح OpenAI في القائمة الجانبية (🔑) أولاً.")
+        log.error("OPENAI_API_KEY غير مضبوط في إعدادات الخادم")
+        raise RuntimeError("الخدمة غير متاحة مؤقتاً. يرجى المحاولة لاحقاً أو التواصل مع المشرف.")
     return OpenAI(api_key=key)
 
 
@@ -1139,10 +1140,6 @@ with st.sidebar:
             st.rerun()
     if LIMITS_ENABLED:
         st.metric("🎟️ المحاولات المتبقية", credits_left())
-
-    if not configured_key():
-        with st.expander("🔑 مفتاح OpenAI", expanded=not st.session_state.get("manual_key")):
-            st.session_state.manual_key = st.text_input("sk-...", type="password", value=st.session_state.get("manual_key", ""))
 
     st.divider()
     st.subheader("📋 بيانات المادة")
