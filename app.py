@@ -1,4 +1,5 @@
 import base64
+import functools
 import io
 import json
 import logging
@@ -24,7 +25,11 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("edu-assistant")
 
-MODEL = "gpt-4o"
+# النموذج الرئيسي (كتابة الجذاذات والامتحانات) ونموذج الصور (قراءة الأوراق والتصحيح).
+# يمكن تغييرهما بدون لمس الكود: أضف OPENAI_MODEL و OPENAI_VISION_MODEL في Secrets على Streamlit.
+DEFAULT_MODEL = "gpt-6.1-sol"
+DEFAULT_VISION_MODEL = "gpt-6.1-terra"
+FALLBACK_MODEL = "gpt-4o"  # يُستعمل تلقائياً إن لم يتوفر النموذج في حسابك
 DB_PATH = "history.db"
 
 # ---- المحاولات المجانية: أوقفناها للتجربة. ضعها True عند ربط الدفع ----
@@ -55,6 +60,15 @@ class LessonTurn(BaseModel):
     draft: Optional[LessonModel]
 
 
+class Chart(BaseModel):
+    kind: Literal["bar", "line", "pie"]
+    title: str
+    x_label: str
+    y_label: str
+    labels: list[str]
+    values: list[float]
+
+
 class Q(BaseModel):
     text: str
     points: float
@@ -62,6 +76,7 @@ class Q(BaseModel):
     objective: str
     answer: str
     lines: int
+    chart: Optional[Chart]
 
 
 class Part(BaseModel):
@@ -159,6 +174,7 @@ def style_run(run, lang, size=12, bold=False):
     rtl = lang == "العربية"
     font = "Arial" if rtl else "Times New Roman"
     code = {"العربية": "ar-TN", "الفرنسية": "fr-FR"}.get(lang, "en-US")
+    bold = bold or bool(run.font.bold)
     run.font.name = font
     run.font.size = Pt(size)
     if bold:
@@ -174,6 +190,8 @@ def style_run(run, lang, size=12, bold=False):
         szCs = OxmlElement("w:szCs")
         szCs.set(qn("w:val"), str(int(size * 2)))
         rPr.find(qn("w:sz")).addnext(szCs)
+    noproof = OxmlElement("w:noProof")
+    rPr.find(qn("w:sz")).addprevious(noproof)
     le = OxmlElement("w:lang")
     le.set(qn("w:val"), code)
     if rtl:
@@ -271,18 +289,167 @@ def cell_text(cell, text, lang, size=11, bold=False, align="center", valign=True
         cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
 
 
+_SEP_RE = re.compile(r"^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
+
+
+def _inline(p, text):
+    """يدعم **عريض** فقط (لا يلمس علامة * في العمليات الحسابية)."""
+    for part in re.split(r"(\*\*[^*]+\*\*)", text):
+        if not part:
+            continue
+        if part.startswith("**") and part.endswith("**") and len(part) > 4:
+            p.add_run(part[2:-2]).bold = True
+        else:
+            p.add_run(part)
+
+
+def _md_table(container, rows, lang, width):
+    cols = max(len(r) for r in rows)
+    t = container.add_table(len(rows), cols)
+    t.style = "Table Grid"
+    if lang == "العربية":
+        rtl_table(t)
+    for j in range(cols):
+        t.columns[j].width = Inches(width / cols)
+    for i, row in enumerate(rows):
+        for j in range(cols):
+            cell = t.cell(i, j)
+            cell.width = Inches(width / cols)
+            if i == 0:
+                shade(cell, "F2F2F2")
+            p = cell.paragraphs[0]
+            _inline(p, row[j] if j < len(row) else "")
+            fmt(p, lang, "center", i == 0, 10.5)
+
+
+def add_markdown(container, text, lang, size=12, width=PAGE_W, align="start"):
+    """يكتب نص Markdown (جداول، **عريض**، عناوين #، قوائم -) داخل مستند أو خلية Word."""
+    if not text or not str(text).strip():
+        return
+    is_cell = hasattr(container, "_tc")
+    first = container.paragraphs[0] if is_cell and not container.paragraphs[0].runs else None
+
+    def new_par():
+        nonlocal first
+        if first is not None:
+            p, first = first, None
+            return p
+        return container.add_paragraph()
+
+    lines = str(text).replace("\r", "").split("\n")
+    i, last_table = 0, False
+    while i < len(lines):
+        line = lines[i].strip()
+        if line.startswith("|") and line.count("|") >= 2:
+            block = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                block.append(lines[i].strip())
+                i += 1
+            rows = [[c.strip() for c in b.strip("|").split("|")] for b in block if not _SEP_RE.match(b)]
+            if rows:
+                _md_table(container, rows, lang, width)
+                last_table = True
+            continue
+        i += 1
+        if not line:
+            continue
+        last_table = False
+        bold, sz = False, size
+        h = re.match(r"^#{1,6}\s+(.*)$", line)
+        if h:
+            line, bold, sz = h.group(1), True, size + 1
+        else:
+            b = re.match(r"^[-*•]\s+(.*)$", line)
+            if b:
+                line = "• " + b.group(1)
+        p = new_par()
+        _inline(p, line)
+        fmt(p, lang, align, bold, sz)
+        p.paragraph_format.space_after = Pt(3)
+    if first is not None:
+        first.paragraph_format.line_spacing = Pt(2)
+    if is_cell and last_table:
+        container.add_paragraph().paragraph_format.line_spacing = Pt(2)
+
+
+def add_figure(container, png, width_in):
+    p = container.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.add_run().add_picture(io.BytesIO(png), width=Inches(width_in))
+
+
+@functools.lru_cache(maxsize=64)
+def _chart_cached(key, lang):
+    from matplotlib.figure import Figure
+
+    ch = json.loads(key)
+    rtl = lang == "العربية"
+
+    def sh(t):
+        t = str(t or "")
+        if rtl:
+            try:
+                import arabic_reshaper
+                from bidi.algorithm import get_display
+
+                return get_display(arabic_reshaper.reshape(t))
+            except Exception:
+                return t
+        return t
+
+    labels = [sh(x) for x in ch.get("labels", [])]
+    vals = [float(v) for v in ch.get("values", [])]
+    n = min(len(labels), len(vals))
+    if n == 0:
+        return None
+    labels, vals = labels[:n], vals[:n]
+    fig = Figure(figsize=(5.4, 3.1))
+    ax = fig.subplots()
+    kind = ch.get("kind")
+    if kind == "pie":
+        ax.pie([abs(v) for v in vals], labels=labels, autopct="%1.0f%%", startangle=90)
+        ax.axis("equal")
+    elif kind == "line":
+        ax.plot(labels, vals, marker="o", color="#2F5597")
+        ax.grid(True, alpha=0.3)
+    else:
+        ax.bar(labels, vals, color="#4472C4")
+        ax.grid(axis="y", alpha=0.3)
+    if kind != "pie":
+        ax.set_xlabel(sh(ch.get("x_label")))
+        ax.set_ylabel(sh(ch.get("y_label")))
+    ax.set_title(sh(ch.get("title")), fontsize=11)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=160)
+    return buf.getvalue()
+
+
+def chart_png(ch, lang):
+    if not ch:
+        return None
+    try:
+        return _chart_cached(json.dumps(ch, sort_keys=True, ensure_ascii=False), lang)
+    except Exception as e:
+        log.warning("تعذر رسم المبيان: %s", e)
+        return None
+
+
 def add_page_border(doc):
     for section in doc.sections:
+        sectPr = section._sectPr
+        for old in sectPr.findall(qn("w:pgBorders")):
+            sectPr.remove(old)
         pg = OxmlElement("w:pgBorders")
         pg.set(qn("w:offsetFrom"), "page")
         for name in ("top", "left", "bottom", "right"):
             b = OxmlElement(f"w:{name}")
-            b.set(qn("w:val"), "single")
+            b.set(qn("w:val"), "double")
             b.set(qn("w:sz"), "12")
             b.set(qn("w:space"), "24")
             b.set(qn("w:color"), "000000")
             pg.append(b)
-        sectPr = section._sectPr
+        # مخطط Word يشترط أن يأتي pgBorders بعد pgMar مباشرة
         pgMar = sectPr.find(qn("w:pgMar"))
         if pgMar is not None:
             pgMar.addnext(pg)
@@ -399,7 +566,13 @@ def create_exam_doc(exam, lang, m, images=None, suffix=""):
             t = make_table(doc, 1, [0.45, PAGE_W - 1.25, 0.8], lang)
             cell_text(t.cell(0, 0), str(n), lang, 12, True)
             shade(t.cell(0, 0), "F2F2F2")
-            cell_text(t.cell(0, 1), q["text"], lang, 12, False, "start")
+            qcell = t.cell(0, 1)
+            add_markdown(qcell, q["text"], lang, 12, width=PAGE_W - 1.45)
+            png = chart_png(q.get("chart"), lang)
+            if png:
+                add_figure(qcell, png, 4.4)
+            else:
+                qcell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
             cell_text(t.cell(0, 2), f"{q['points']:g} {L['pts']}", lang, 11, True)
             lines = max(0, min(int(q.get("lines", 0)), 14))
             if lines:
@@ -456,8 +629,13 @@ def create_answer_key_doc(exam, lang, m):
         spacer(doc, 6)
         for q in part["questions"]:
             n += 1
-            add_par(doc, f"{n}- {q['text']}  —  {q['points']:g} {L['pts']}", lang, "start", True, 12, after=2)
-            add_par(doc, f"{L['answer']}: {q['answer']}", lang, "start", False, 12, after=10)
+            add_par(doc, f"{n}-  ({q['points']:g} {L['pts']})", lang, "start", True, 12, after=2)
+            add_markdown(doc, q["text"], lang, 12)
+            png = chart_png(q.get("chart"), lang)
+            if png:
+                add_figure(doc, png, 4.0)
+            add_markdown(doc, f"**{L['answer']}:** {q['answer']}", lang, 12)
+            spacer(doc, 10)
     add_par(doc, f"{L['total']}: {exam_total(exam):g}", lang, "center", True, 13)
     return finish(doc)
 
@@ -475,7 +653,8 @@ def create_lesson_doc(data, lang, m, images=None):
         ht = make_table(doc, 1, [PAGE_W], lang)
         shade(ht.cell(0, 0), "F2F2F2")
         cell_text(ht.cell(0, 0), block["heading"], lang, 13, True, "start")
-        add_par(doc, block["content"], lang, "start", False, 12, after=10)
+        add_markdown(doc, block["content"], lang, 12)
+        spacer(doc, 8)
     add_images_annex(doc, lang, images)
     return finish(doc)
 
@@ -648,10 +827,64 @@ def get_client():
     return OpenAI(api_key=key)
 
 
-def parse_structured(messages, model_cls, temperature=0.3):
-    resp = get_client().beta.chat.completions.parse(
-        model=MODEL, messages=messages, response_format=model_cls, temperature=temperature
-    )
+def _setting(name, default):
+    try:
+        if name in st.secrets:
+            return str(st.secrets[name])
+    except Exception:
+        pass
+    return os.environ.get(name, default)
+
+
+def model_for(kind):
+    if kind == "vision":
+        return _setting("OPENAI_VISION_MODEL", DEFAULT_VISION_MODEL)
+    return _setting("OPENAI_MODEL", DEFAULT_MODEL)
+
+
+def _is_legacy(model):
+    return model.startswith(("gpt-4", "gpt-3"))
+
+
+def _params(model, temperature, effort, max_out):
+    """نماذج الاستدلال الحديثة لا تقبل temperature وتقبل reasoning_effort؛ والقديمة العكس."""
+    kw = {}
+    if _is_legacy(model):
+        if temperature is not None:
+            kw["temperature"] = temperature
+        if max_out:
+            kw["max_completion_tokens"] = max_out
+    elif effort:
+        kw["reasoning_effort"] = effort
+    return kw
+
+
+def _model_unavailable(e):
+    msg = str(e).lower()
+    return "model" in msg and any(k in msg for k in ("does not exist", "not found", "access", "not supported", "unsupported", "invalid", "unknown"))
+
+
+def llm(kind, messages, temperature=None, effort="medium", max_out=None, response_format=None):
+    """نداء موحّد لـ OpenAI مع رجوع تلقائي إلى gpt-4o إن لم يتوفر النموذج الجديد."""
+    client = get_client()
+    models = [model_for(kind)]
+    if models[0] != FALLBACK_MODEL:
+        models.append(FALLBACK_MODEL)
+    for m in models:
+        kw = _params(m, temperature, effort, max_out)
+        try:
+            if response_format is not None:
+                return client.beta.chat.completions.parse(model=m, messages=messages, response_format=response_format, **kw)
+            return client.chat.completions.create(model=m, messages=messages, **kw)
+        except Exception as e:
+            if m != models[-1] and _model_unavailable(e):
+                log.warning("النموذج %s غير متاح (%s). نجرّب %s", m, e, models[-1])
+                continue
+            raise
+
+
+def parse_structured(messages, model_cls, temperature=0.3, kind="text", effort="medium"):
+    resp = llm(kind, messages, temperature, effort, response_format=model_cls)
     msg = resp.choices[0].message
     if msg.parsed is None:
         raise RuntimeError(msg.refusal or "تعذر على النموذج إنتاج نتيجة منظمة. أعد المحاولة.")
@@ -685,8 +918,8 @@ def looks_like_refusal(text):
 
 
 def ocr_image(b):
-    r = get_client().chat.completions.create(
-        model=MODEL, temperature=0, max_tokens=3000,
+    r = llm(
+        "vision", temperature=0, effort="low", max_out=3000,
         messages=[
             {"role": "system", "content": "أنت أداة نسخ نصوص (OCR). الصور التي تصلك صفحات تعليمية (دروس، تمارين، امتحانات) يرفعها أستاذ. "
                                           "انسخ كل النص المكتوب بدقة وبلغته الأصلية وبنفس ترتيبه، بما فيه الكتابة اليدوية. "
@@ -704,7 +937,7 @@ def extract_style(images, kind_label):
                                       "توزيع النقاط، الصياغة والمصطلحات واللغة. لا تنقل محتوى الدرس نفسه، فقط الطريقة. في حدود 12 سطراً."}]
     for b in images:
         parts.append({"type": "image_url", "image_url": {"url": data_url(shrink(b))}})
-    r = get_client().chat.completions.create(model=MODEL, temperature=0.2, max_tokens=1200, messages=[{"role": "user", "content": parts}])
+    r = llm("vision", [{"role": "user", "content": parts}], temperature=0.2, effort="low", max_out=1200)
     return r.choices[0].message.content or ""
 
 
@@ -739,6 +972,38 @@ GRADES_SECONDARY = ["السابعة أساسي", "الثامنة أساسي", "�
 NO_SECTION_GRADES = ["السابعة أساسي", "الثامنة أساسي", "التاسعة أساسي"]
 SECTION_NONE = "— بدون —"
 SECTIONS = [SECTION_NONE, "جذع مشترك", "آداب", "رياضيات", "علوم تجريبية", "علوم الإعلامية", "تقنية", "اقتصاد وتصرف", "رياضة"]
+
+PRESET_NONE = "— بدون —"
+PRESETS = {
+    "الرياضيات والعلوم والفيزياء": {
+        "lesson": "أبدأ بنشاط اكتشاف أو مسألة انطلاق، ثم التعريفات والخاصيات (ألخّصها في جدول)، ثم البراهين خطوة بخطوة، ثم أمثلة محلولة، ثم تمارين تطبيقية متدرجة الصعوبة. أكتب الرموز بوضوح (x²، √، π).",
+        "exam": "تمارين مستقلة متدرجة الصعوبة، في كل تمرين أسئلة فرعية بنقاطها، وتمرين أو مسألة إدماجية في الأخير. أكتب المعطيات بوضوح، وأدرج جدولاً أو مبياناً عندما يحتاجه السؤال.",
+    },
+    "التاريخ والجغرافيا": {
+        "lesson": "أبدأ بإشكالية، ثم سندات ووثائق (نص تاريخي، خريطة، جدول إحصائي)، ثم تحليل، ثم استنتاج. أذكر التواريخ والأسماء بدقة، وألخّص المقارنات في جداول.",
+        "exam": "جزء للمعرفة (تواريخ ومفاهيم)، وجزء لتحليل وثيقة (سند ثم تعليمات)، وجزء للإنتاج الكتابي (فقرة أو تركيب).",
+    },
+    "التربية المدنية والإسلامية": {
+        "lesson": "مدار الاهتمام، ثم وضعية انطلاق، ثم سند، ثم تعليمة وأنشطة، ثم خلاصة، ثم تقييم.",
+        "exam": "جزء للمعرفة، وجزء للتطبيق على سند، ووضعية إدماجية في الأخير.",
+    },
+    "الفلسفة": {
+        "lesson": "أبدأ بالإشكالية وطرح المشكل، ثم محاولة الحل: موقف أول ونقده، موقف ثانٍ ونقده، ثم التركيب والخاتمة. أستشهد بأقوال الفلاسفة بين قوسين.",
+        "exam": "تحليل نص فلسفي أو معالجة إشكالية: فهم، وتحليل، ومناقشة، وموقف شخصي معلَّل.",
+    },
+    "اللغات (عربية، فرنسية، إنجليزية)": {
+        "lesson": "نص اعتماد، ثم ملاحظة، ثم شرح وتحليل (مفردات وصور بيانية)، ثم قواعد أو بلاغة (ألخّصها في جدول)، ثم تعبير وإنتاج.",
+        "exam": "جزء لفهم النص، وجزء للقواعد والصرف والبلاغة، وجزء للإنتاج الكتابي.",
+    },
+    "الاقتصاد والتصرف": {
+        "lesson": "المفاهيم، ثم القوانين والعلاقات، ثم جداول تحليلية، ثم دراسة حالة رقمية، ثم تطبيق عددي.",
+        "exam": "جزء للمفاهيم، وجزء للتطبيق العددي (بجداول ومعطيات)، ودراسة حالة في الأخير.",
+    },
+    "الإعلامية والتكنولوجيا": {
+        "lesson": "أبدأ بوضعية مشكل، ثم المفاهيم والتعريفات، ثم أمثلة وخوارزميات أو مخططات، ثم تمارين تطبيقية.",
+        "exam": "جزء للمعرفة، وتمارين تطبيقية متدرجة (برمجة أو مخططات أو جداول)، ووضعية إدماجية.",
+    },
+}
 
 PROFILE_DEFAULTS = {
     "name": "", "school": "المعهد الثانوي", "cycle": "إعدادي وثانوي", "grade": "السابعة أساسي", "section": SECTION_NONE,
@@ -821,6 +1086,7 @@ def lesson_system():
 4. اجعل المستوى مناسباً لتلاميذ {grade_label()}.
 5. تحقق داخلياً من دقة المعلومات قبل الإجابة، ولا تكتب هذه المراجعة.
 6. في reply جملة أو جملتان فقط: ما فعلته أو ما تحتاجه. لا تكرر المسودة في reply.
+7. التنسيق داخل content: استعمل **العريض** والقوائم (- عنصر) والعناوين (# عنوان)، وجداول Markdown (| عمود | عمود |) عند الحاجة لتلخيص خاصيات أو مقارنات. كل ذلك يظهر منسقاً في Word.
 
 المسودة الحالية:
 {json.dumps(draft, ensure_ascii=False) if draft else 'لا توجد بعد.'}"""
@@ -844,6 +1110,9 @@ def exam_system(exam_title, total):
 6. الأسئلة مناسبة لمستوى {grade_label()} وتغطي مستويات معرفية متنوعة.
 7. تحقق داخلياً من صحة الأسئلة والإصلاح، ولا تكتب هذه المراجعة.
 8. في reply جملتان على الأكثر: ما فعلته أو سؤالك. لا تكرر نص الامتحان.
+9. الجداول: عندما يحتاج السؤال إلى جدول (معطيات، جدول قيم، جدول إحصائي...) فاكتبه داخل text بصيغة جدول Markdown (| عمود | عمود |) وسطر الفاصل (|---|---|)، فيظهر في ورقة Word جدولاً حقيقياً. والنقاط والترقيم لا تدخل في text.
+10. المبيانات: عندما يحتاج السؤال إلى سند بياني فاستعمل الحقل chart (kind: bar/line/pie، title، x_label، y_label، labels، values) بأرقام قدّمها الأستاذ أو أرقام معروفة وصحيحة. لا تخترع إحصاءات وأرقاماً واقعية. وإن لم يحتج السؤال إلى مبيان فاجعل chart = null.
+11. الرموز الرياضية والعلمية: اكتبها نصاً واضحاً يظهر في Word (x²، √، π، ≤، →...).
 
 المسودة الحالية:
 {json.dumps(draft, ensure_ascii=False) if draft else 'لا توجد بعد.'}"""
@@ -1019,6 +1288,9 @@ def preview_exam(lang, meta, target, attach):
             for q in part["questions"]:
                 n += 1
                 st.markdown(f"**{n}.** {q['text']}  \n`{q['points']:g} {L['pts']}` · {q['level']}")
+                png = chart_png(q.get("chart"), lang)
+                if png:
+                    st.image(png, width=380)
     with t_edit:
         st.caption("عدّل نص السؤال أو نقاطه أو مستواه مباشرة. ولتغيير بنية الامتحان (إضافة، حذف، أجزاء) اكتب لي في المحادثة.")
         rows = [{"الجزء": pt, "السؤال": q["text"], "النقاط": float(q["points"]), "المستوى": q["level"]} for pt, q in all_questions(d)]
@@ -1186,10 +1458,23 @@ def profile_ui():
 
     st.markdown("#### 🧭 طريقتي في العمل")
     st.caption("اكتب بكلامك كيف تحضّر درسك وكيف تبني امتحانك، أو دع التطبيق يتعلمها من وثائقك السابقة.")
+    pc1, pc2 = st.columns([3, 1])
+    with pc1:
+        preset = st.selectbox("قالب جاهز حسب المجال (اختياري، تعدّله كما تشاء)", [PRESET_NONE] + list(PRESETS), key="preset_pick")
+    with pc2:
+        st.write("")
+        preset_go = st.button("تطبيق القالب", key="preset_go")
+    if preset_go and preset != PRESET_NONE:
+        st.session_state["replace_method_lesson"] = PRESETS[preset]["lesson"]
+        st.session_state["replace_method_exam"] = PRESETS[preset]["exam"]
+        st.rerun()
     for kind, label, ph in (
         ("lesson", "طريقتي في تحضير الدرس", "مثال: أبدأ بوضعية انطلاق، ثم سند ووثيقة، ثم أنشطة، وأختم بتقييم من 3 أسئلة."),
         ("exam", "طريقتي في بناء الامتحان", "مثال: جزء للمعرفة (8 ن)، جزء للتطبيق (8 ن)، ووضعية إدماجية (4 ن)."),
     ):
+        replace = st.session_state.pop(f"replace_method_{kind}", None)
+        if replace:
+            st.session_state[f"pf_method_{kind}"] = replace
         pending = st.session_state.pop(f"pending_method_{kind}", None)
         if pending:
             cur = st.session_state.get(f"pf_method_{kind}", "").strip()
@@ -1303,7 +1588,7 @@ with tab_grader:
                     r = parse_structured(
                         [{"role": "system", "content": system},
                          {"role": "user", "content": [{"type": "image_url", "image_url": {"url": data_url(shrink(f.getvalue()))}}]}],
-                        StudentResult, 0.2)
+                        StudentResult, 0.2, kind="vision")
                     results.append(r.model_dump())
                 except Exception as e:
                     log.exception("grading %s", f.name)
@@ -1343,8 +1628,8 @@ with tab_grader:
                 with st.spinner("جاري التحليل..."):
                     try:
                         summary = "\n".join(f"- ({mk['category']}) {mk['description']}" for r in results for mk in r["mistakes"])
-                        resp = get_client().chat.completions.create(
-                            model=MODEL, temperature=0.4,
+                        resp = llm(
+                            "text", temperature=0.4,
                             messages=[{"role": "user", "content": f"""أنت مفتش تربوي. هذه أخطاء تلاميذ قسم في {prof('subject')} ({grade_label()}):
 {summary}
 

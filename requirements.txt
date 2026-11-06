@@ -5,3 +5,6 @@ pandas
 openpyxl
 pydantic>=2
 pillow
+matplotlib
+arabic-reshaper
+python-bidi
