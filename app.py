@@ -33,7 +33,7 @@ FALLBACK_MODEL = "gpt-4o"  # يُستعمل تلقائياً إن لم يتوف�
 DB_PATH = "history.db"
 
 # ---- المحاولات المجانية: أوقفناها للتجربة. ضعها True عند ربط الدفع ----
-LIMITS_ENABLED = True
+LIMITS_ENABLED = False
 GUEST_FREE = 0
 MEMBER_FREE = 30
 
@@ -760,7 +760,57 @@ def docx_to_pdf(data):
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
+def database_url():
+    try:
+        if "DATABASE_URL" in st.secrets:
+            return str(st.secrets["DATABASE_URL"]).strip()
+    except Exception:
+        pass
+    return os.environ.get("DATABASE_URL", "").strip()
+
+
+def _pg_sql(sql):
+    """يترجم أوامر SQLite المستعملة إلى PostgreSQL."""
+    sql = sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY").replace("BLOB", "BYTEA")
+    sql = sql.replace("chat_type TEXT)", "chat_type TEXT, seq BIGSERIAL)")
+    sql = sql.replace("ORDER BY rowid DESC", "ORDER BY seq DESC")
+    if sql.startswith("INSERT OR REPLACE INTO drafts"):
+        sql = ("INSERT INTO drafts VALUES (?,?,?) ON CONFLICT (chat_id) DO UPDATE "
+               "SET kind=EXCLUDED.kind, data=EXCLUDED.data")
+    if sql.startswith("INSERT OR REPLACE INTO grade_sets"):
+        sql = ("INSERT INTO grade_sets VALUES (?,?) ON CONFLICT (owner) DO UPDATE SET data=EXCLUDED.data")
+    return sql.replace("?", "%s")
+
+
+class PgConn:
+    """غلاف رفيع يجعل اتصال PostgreSQL يتصرف كاتصال sqlite المستعمل في التطبيق."""
+
+    def __init__(self, url):
+        import psycopg2
+        self.c = psycopg2.connect(url, connect_timeout=10)
+
+    def execute(self, sql, params=()):
+        cur = self.c.cursor()
+        cur.execute(_pg_sql(sql), params)
+        return cur
+
+    def cursor(self):
+        return self
+
+    def commit(self):
+        self.c.commit()
+
+    def close(self):
+        self.c.close()
+
+
+def using_pg():
+    return bool(database_url())
+
+
 def db():
+    if using_pg():
+        return PgConn(database_url())
     return sqlite3.connect(DB_PATH)
 
 
@@ -771,12 +821,28 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, role TEXT, content TEXT, image BLOB)""")
     c.execute("""CREATE TABLE IF NOT EXISTS accounts (email TEXT PRIMARY KEY, display_name TEXT, used INTEGER DEFAULT 0, created TEXT, profile TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS drafts (chat_id TEXT PRIMARY KEY, kind TEXT, data TEXT)""")
-    try:
-        c.execute("ALTER TABLE accounts ADD COLUMN profile TEXT")
-    except sqlite3.OperationalError:
-        pass
+    c.execute("""CREATE TABLE IF NOT EXISTS grade_sets (owner TEXT PRIMARY KEY, data TEXT)""")
+    if not using_pg():
+        try:
+            c.execute("ALTER TABLE accounts ADD COLUMN profile TEXT")
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     conn.close()
+
+
+def save_grade_set(owner, data):
+    conn = db()
+    conn.execute("INSERT OR REPLACE INTO grade_sets VALUES (?,?)", (owner, json.dumps(data, ensure_ascii=False)))
+    conn.commit()
+    conn.close()
+
+
+def load_grade_set(owner):
+    conn = db()
+    row = conn.execute("SELECT data FROM grade_sets WHERE owner=?", (owner,)).fetchone()
+    conn.close()
+    return json.loads(row[0]) if row and row[0] else None
 
 
 def get_or_create_account(email):
@@ -858,9 +924,12 @@ def load_chat_history(chat_id):
     out = []
     for role, content, image in rows:
         # صور إضافية بلا نص تُدمج مع الرسالة السابقة
+        if image is not None:
+            image = bytes(image)
         if role == "user" and not content and image and out and out[-1]["role"] == "user":
             out[-1]["images"].append(image)
             continue
+        image = bytes(image) if image is not None else None
         out.append({"role": role, "content": content or "", "images": [image] if image else []})
     return out
 
@@ -905,6 +974,7 @@ def delete_account_data(email):
         conn.execute("DELETE FROM messages WHERE chat_id=?", (cid,))
         conn.execute("DELETE FROM drafts WHERE chat_id=?", (cid,))
     conn.execute("DELETE FROM chats WHERE teacher=?", (email,))
+    conn.execute("DELETE FROM grade_sets WHERE owner=?", (email,))
     conn.execute("DELETE FROM accounts WHERE email=?", (email,))
     conn.commit()
     conn.close()
@@ -930,7 +1000,9 @@ def friendly_error(e):
     return "حدث خطأ غير متوقع. أعد المحاولة، وإن تكرر فراسل الدعم."
 
 
-init_db()
+if not st.session_state.get("_db_ready"):
+    init_db()
+    st.session_state["_db_ready"] = True
 
 # =====================================================================
 # المفتاح وعميل OpenAI
@@ -1415,6 +1487,7 @@ def preview_lesson(lang, attach):
     if not d:
         st.info("📄 ستظهر هنا مسودة الجذاذة بعد أن تحدثني عن الدرس.")
         return
+    st.caption("✨ المسودة جاهزة: عدّلها بالكلام كما تشاء قبل التحميل.")
     st.markdown(f"### {d['title']}")
     st.caption(f"{LABELS[lang]['field']}: {d['field']}")
     for b in d["lesson_blocks"]:
@@ -1430,6 +1503,7 @@ def preview_exam(lang, meta, target, attach):
     if not d:
         st.info("📝 ستظهر هنا مسودة الامتحان بعد أن تحدد مواضيعه.")
         return
+    st.caption("✨ المسودة جاهزة: عدّلها بالكلام كما تشاء قبل التحميل.")
     L = LABELS[lang]
     chat_id = st.session_state["chat_id_exam"]
     ver = st.session_state.get("ver_exam", 0)
@@ -1568,11 +1642,14 @@ if "user" not in st.session_state:
         st.markdown(PRIVACY_TEXT)
     consent = st.checkbox("قرأت سياسة الخصوصية وأوافق عليها، وأتحمّل مسؤولية استعمال أسماء التلاميذ وفق الضوابط المعمول بها في مؤسستي.", key="consent_ok")
     if consent:
+        if st.button("🚀 جرّب الآن بدون تسجيل", type="primary", use_container_width=True):
+            st.session_state.user = {"email": None, "owner": "guest:" + str(uuid.uuid4()), "display": "الأستاذ(ة)"}
+            st.rerun()
+        st.markdown("**أو ادخل ببريدك** ليُحفظ ملفك وسجلك:")
         email_box("landing")
     else:
         st.caption("وافق على الشروط أعلاه لتتمكن من الدخول.")
     st.stop()
-
 user = st.session_state.user
 init_profile_state()
 for _k in ("lesson", "exam"):
@@ -1589,13 +1666,12 @@ with st.sidebar:
             st.session_state.clear()
             st.rerun()
     else:
-        st.caption("👤 زائر")
+        st.caption("👤 زائر — لن يُحفظ ملفك. ادخل ببريدك لحفظه.")
         if st.button("📧 دخول ببريدي", use_container_width=True):
             st.session_state.clear()
             st.rerun()
     if LIMITS_ENABLED and user["email"]:
         st.metric("🎟️ المحاولات المتبقية", credits_left())
-    st.warning("⚠️ مخرجات الذكاء الاصطناعي قد تخطئ، راجعها قبل الاعتماد.")
 
     st.divider()
     st.subheader("📋 بيانات المادة")
@@ -1759,8 +1835,18 @@ with tab_exam:
 
 # ---------- المصحح ----------
 with tab_grader:
+    if user["email"] and not st.session_state.get("grades_loaded"):
+        st.session_state.grades_loaded = True
+        try:
+            _gs = load_grade_set(user["email"])
+        except Exception:
+            _gs = None
+        if _gs and "grades" not in st.session_state:
+            st.session_state.grades = _gs.get("grades")
+            st.session_state.roster = _gs.get("roster") or []
+            st.session_state.class_name = _gs.get("class_name", "")
     st.subheader("🔍 المصحح البيداغوجي الآلي (جماعي)")
-    st.info("📸 ارفع صور أوراق عدة تلاميذ دفعة واحدة. ستحصل على جدول نتائج (Excel) وتحليل لأخطاء القسم.")
+    st.info("📸 اختر الامتحان، ثم أضف تلاميذك واحداً واحداً (أو ارفع دفعة كاملة). ستحصل على جدول نتائج قابل للتعديل وتقرير للقسم.")
 
     # ---- قائمة القسم (اختيارية) ----
     def parse_roster(text, file):
@@ -1797,10 +1883,12 @@ with tab_grader:
     _roster = st.session_state.get("roster") or []
     _by_order = bool(_roster) and str(st.session_state.get("roster_mode", "")).startswith("حسب")
 
-    def apply_roster(d, idx):
+    def apply_roster(d, idx, by_order=None):
+        if by_order is None:
+            by_order = _by_order
         if not _roster:
             return d
-        if _by_order:
+        if by_order:
             if idx - 1 < len(_roster):
                 d["student_name"] = _roster[idx - 1]
         else:
@@ -1809,22 +1897,82 @@ with tab_grader:
             if hit:
                 d["student_name"] = hit[0]
         return d
-    draft = st.session_state.get("draft_exam")
-    use_key = st.checkbox("استعمل سلّم إصلاح الامتحان الحالي", value=bool(draft), disabled=not draft, key="use_key")
-    student_imgs = st.file_uploader("أوراق التلاميذ", type=IMG_TYPES, accept_multiple_files=True, key="student_files")
-    if student_imgs and len(student_imgs) > 40:
-        st.warning("الحد الأقصى 40 ورقة في كل مرة؛ سيُعالج أول 40 فقط.")
-        student_imgs = student_imgs[:40]
-    pages_per = st.number_input("عدد صفحات (صور) ورقة كل تلميذ", min_value=1, max_value=10, value=1, step=1, key="pages_per",
-                                help="1 = كل صورة تلميذ مختلف. ضع 5 مثلاً إن كان لكل تلميذ 5 صفحات: سترفعها مرتبة، وتُحسب كل 5 صور تلميذاً واحداً.")
-    if student_imgs and pages_per > 1:
-        st.caption(f"سيُصحَّح {math.ceil(len(student_imgs) / pages_per)} تلميذ(ة) من {len(student_imgs)} صورة. رتّب الصور بحيث تتتالى صفحات كل تلميذ.")
+    # ---- 1) اختيار الامتحان (سلّم الإصلاح) ----
+    _opts = {"بدون سلّم إصلاح (أصحّح بشروطي أسفله)": None}
+    if st.session_state.get("draft_exam"):
+        _opts["الامتحان المفتوح الآن"] = ("current", None)
+    try:
+        for c_id, c_title, c_time, c_type in get_all_chats(user["owner"])[:20]:
+            if c_type != "lesson":
+                _opts[f"{c_title} — {c_time}"] = ("saved", c_id)
+    except Exception:
+        pass
+    _labels = list(_opts)
+    _default = 1 if len(_labels) > 1 and _labels[1] == "الامتحان المفتوح الآن" else 0
+    _pick = st.selectbox("📝 الامتحان الذي سأصحّح على أساسه", _labels, index=_default, key="grade_exam_pick")
+    draft, _sel = None, _opts.get(_pick)
+    if _sel:
+        draft = st.session_state.get("draft_exam") if _sel[0] == "current" else load_draft(_sel[1])
+    use_key = bool(draft)
+    if draft:
+        st.caption(f"سيُصحَّح على سلّم إصلاح هذا الامتحان (العلامة القصوى {exam_total(draft):g}).")
+
+    # ---- 2) أوراق التلاميذ ----
+    grade_mode = st.radio("طريقة إضافة الأوراق", ["تلميذ بتلميذ (الأسهل)", "دفعة واحدة (صور مرتبة)"],
+                          horizontal=True, key="grade_mode")
+    batch = not str(grade_mode).startswith("تلميذ")
+    groups_in = []
+    if not batch:
+        if "n_students" not in st.session_state:
+            st.session_state.n_students = 1
+
+        def _add_student():
+            st.session_state.n_students += 1
+
+        def _del_student():
+            st.session_state.n_students = max(1, st.session_state.n_students - 1)
+
+        for k in range(int(st.session_state.n_students)):
+            with st.container(border=True):
+                ca, cb = st.columns([1, 2])
+                if _roster:
+                    pick = ca.selectbox(f"التلميذ {k + 1}", ["(يُقرأ الاسم من الورقة)"] + _roster, key=f"stu_name_{k}")
+                    nm = "" if str(pick).startswith("(") else pick
+                else:
+                    nm = str(ca.text_input(f"اسم التلميذ {k + 1} (اختياري)", key=f"stu_name_{k}")).strip()
+                fs = cb.file_uploader("صفحات ورقته (يمكن رفع عدة صور)", type=IMG_TYPES, accept_multiple_files=True,
+                                      key=f"stu_files_{k}")
+                if fs:
+                    groups_in.append((list(fs), nm))
+        bc1, bc2, _sp = st.columns([1, 1, 3])
+        bc1.button("➕ تلميذ آخر", on_click=_add_student, key="add_stu")
+        bc2.button("➖ حذف الأخير", on_click=_del_student, key="del_stu")
+    else:
+        student_imgs = st.file_uploader("أوراق التلاميذ", type=IMG_TYPES, accept_multiple_files=True, key="student_files")
+        pages_per = st.number_input("عدد صفحات (صور) ورقة كل تلميذ", min_value=1, max_value=10, value=1, step=1, key="pages_per",
+                                    help="1 = كل صورة تلميذ مختلف. ضع 5 مثلاً إن كان لكل تلميذ 5 صفحات: سترفعها مرتبة.")
+        if student_imgs:
+            _n = int(pages_per)
+            groups_in = [(list(student_imgs[j:j + _n]), "") for j in range(0, len(student_imgs), _n)]
+            if _n > 1:
+                st.caption(f"سيُصحَّح {len(groups_in)} تلميذ(ة) من {len(student_imgs)} صورة. رتّب الصور بحيث تتتالى صفحات كل تلميذ.")
+
+    _total_imgs = sum(len(g) for g, _ in groups_in)
+    if _total_imgs > 40:
+        st.warning("الحد الأقصى 40 صورة في كل مرة؛ سيُعالج أول 40 فقط.")
+        _kept, _c = [], 0
+        for g, nm_ in groups_in:
+            if _c + len(g) > 40:
+                break
+            _kept.append((g, nm_)); _c += len(g)
+        groups_in, _total_imgs = _kept, _c
+
     grading_instructions = st.text_area("شروط التصحيح وسلّم التنقيط", "قم بتصحيح الأخطاء، واعط علامة مع ملاحظة مشجعة.", key="grading_text")
 
     if st.button("🚀 تصحيح الأوراق", type="primary", key="grade_go"):
-        if not student_imgs:
+        if not groups_in:
             st.warning("⚠️ الرجاء رفع ورقة واحدة على الأقل.")
-        elif require_credit(len(student_imgs)):
+        elif require_credit(_total_imgs):
             instr, max_note = grading_instructions, ""
             if use_key and draft:
                 key_text = "\n".join(f"{i}. {q['text']} ({q['points']:g} ن) ← الإصلاح: {q['answer']}"
@@ -1832,12 +1980,10 @@ with tab_grader:
                 instr += f"\n\nسلّم الإصلاح الرسمي:\n{key_text}"
                 max_note = f" العلامة القصوى {exam_total(draft):g}."
             results, bar = [], st.progress(0.0, text="بدء التصحيح...")
-            _n = int(pages_per)
-            groups = [student_imgs[j:j + _n] for j in range(0, len(student_imgs), _n)]
-            for i, grp in enumerate(groups, 1):
+            for i, (grp, nm) in enumerate(groups_in, 1):
                 f = grp[0]
-                bar.progress((i - 1) / len(groups), text=f"تصحيح الورقة {i}/{len(groups)}: {f.name}")
-                label = f"ورقة {i}" if _by_order else f.name
+                bar.progress((i - 1) / len(groups_in), text=f"تصحيح الورقة {i}/{len(groups_in)}: {nm or f.name}")
+                label = f"ورقة {i}" if (nm or (batch and _by_order)) else f.name
                 system = f"""أنت أستاذ ومفتش تربوي تونسي خبير في المادة ({prof('subject')}) والمستوى ({grade_label()}).
 حلّل ورقة التلميذ المرفقة بدقة:
 1. اقرأ اسم التلميذ (إن لم يظهر فاكتب: {label}) وانسخ إجابته.
@@ -1852,19 +1998,30 @@ with tab_grader:
                         [{"role": "system", "content": system},
                          {"role": "user", "content": [{"type": "image_url", "image_url": {"url": data_url(shrink(g.getvalue()))}} for g in grp]}],
                         StudentResult, 0.2, kind="vision")
-                    results.append(apply_roster(r.model_dump(), i))
+                    d_ = r.model_dump()
+                    if nm:
+                        d_["student_name"] = nm
+                    else:
+                        d_ = apply_roster(d_, i, bool(batch and _by_order))
+                    results.append(d_)
                 except Exception as e:
                     log.exception("grading %s", f.name)
-                    st.error(f"تعذر تصحيح {f.name}. جرّب صورة أوضح.")
+                    st.error(f"تعذر تصحيح {nm or f.name}. جرّب صورة أوضح.")
             bar.progress(1.0, text="اكتمل التصحيح")
             st.session_state.grades = results
             st.session_state.grades_ver = st.session_state.get("grades_ver", 0) + 1
+            if user["email"]:
+                try:
+                    save_grade_set(user["email"], {"grades": results, "roster": st.session_state.get("roster", []),
+                                                   "class_name": st.session_state.get("class_name", "")})
+                except Exception:
+                    log.exception("save grade set")
             st.session_state.pop("class_analysis", None)
 
     results = st.session_state.get("grades")
     if results:
         df = pd.DataFrame([{"التلميذ": r["student_name"], "العلامة": r["score"], "من": r["max_score"], "الملاحظة": r["comment"]} for r in results])
-        st.caption("✏️ يمكنك تعديل العلامة أو الاسم أو الملاحظة لأي تلميذ مباشرة في الجدول قبل التصدير.")
+        st.caption("✏️ النتائج مقترحة منك أنت تعتمدها: عدّل العلامة أو الاسم أو الملاحظة لأي تلميذ مباشرة في الجدول قبل التصدير.")
         _ed = st.data_editor(
             df, use_container_width=True, hide_index=True, key=f"grades_editor_{st.session_state.get('grades_ver', 0)}",
             column_config={"العلامة": st.column_config.NumberColumn(min_value=0.0, step=0.25),
@@ -1878,6 +2035,14 @@ with tab_grader:
             except (TypeError, ValueError):
                 pass
         df = pd.DataFrame([{"التلميذ": r["student_name"], "العلامة": r["score"], "من": r["max_score"], "الملاحظة": r["comment"]} for r in results])
+        if user["email"] and st.button("💾 حفظ التعديلات", key="save_grades"):
+            try:
+                save_grade_set(user["email"], {"grades": results, "roster": st.session_state.get("roster", []),
+                                               "class_name": st.session_state.get("class_name", "")})
+                st.success("تم حفظ النتائج ✅")
+            except Exception:
+                log.exception("save grade set")
+                st.error("تعذّر الحفظ. أعد المحاولة.")
         scores20 = [r["score"] / r["max_score"] * 20 for r in results if r["max_score"]]
         if scores20:
             m1, m2, m3 = st.columns(3)
