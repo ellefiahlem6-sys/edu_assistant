@@ -33,11 +33,12 @@ FALLBACK_MODEL = "gpt-4o"  # يُستعمل تلقائياً إن لم يتوف�
 DB_PATH = "history.db"
 
 # ---- المحاولات المجانية: أوقفناها للتجربة. ضعها True عند ربط الدفع ----
-LIMITS_ENABLED = False
-GUEST_FREE = 3
-MEMBER_FREE = 15
+LIMITS_ENABLED = True
+GUEST_FREE = 0
+MEMBER_FREE = 30
 
 IMG_TYPES = ["png", "jpg", "jpeg"]
+DOC_TYPES = ["docx", "xlsx", "csv", "txt", "pdf"]
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
@@ -659,6 +660,98 @@ def create_lesson_doc(data, lang, m, images=None):
     return finish(doc)
 
 
+
+def create_grades_doc(rows, lang, m, class_name="", date_txt="", title="كشف النقط"):
+    """rows: list of dicts {name, score, max, comment}. جدول مؤطر جاهز للطباعة."""
+    doc = new_doc()
+    add_par(doc, title, lang, "center", True, 16, after=6)
+    info = [x for x in (
+        f"المعهد: {m['school']}" if m.get("school") else "",
+        f"الأستاذ(ة): {m['teacher']}" if m.get("teacher") else "",
+        f"المادة: {m['subject']}", f"المستوى: {m['grade']}",
+        f"القسم: {class_name}" if class_name else "",
+        f"التاريخ: {date_txt}" if date_txt else "") if x]
+    add_par(doc, "   |   ".join(info), lang, "center", False, 11, after=8)
+    widths = [0.45, 2.4, 0.9, 2.9]
+    t = make_table(doc, len(rows) + 1, widths, lang)
+    for i, h in enumerate(["ر.ت", "الاسم واللقب", "العلامة", "الملاحظة"]):
+        cell_text(t.rows[0].cells[i], h, lang, 11, True)
+        shade(t.rows[0].cells[i])
+    for n, r in enumerate(rows, 1):
+        sc = r.get("score")
+        mark = "" if sc in (None, "") else f"{sc:g}/{r['max']:g}"
+        vals = [str(n), r.get("name", ""), mark, r.get("comment", "")]
+        for i, v in enumerate(vals):
+            cell_text(t.rows[n].cells[i], v, lang, 10, False, "start" if i == 3 else "center")
+    return finish(doc)
+
+
+def create_class_report_doc(results, lang, m, class_name="", exam_title="", date_txt=""):
+    """تقرير القسم: صفحة ملخص ثم صفحة لكل تلميذ (العلامة، الأخطاء، الملاحظة)."""
+    doc = new_doc()
+
+    def head(title):
+        add_par(doc, title, lang, "center", True, 15, after=4)
+        info = [x for x in (
+            f"المعهد: {m['school']}" if m.get("school") else "",
+            f"الأستاذ(ة): {m['teacher']}" if m.get("teacher") else "",
+            f"المادة: {m['subject']}", f"المستوى: {m['grade']}",
+            f"القسم: {class_name}" if class_name else "",
+            f"الامتحان: {exam_title}" if exam_title else "",
+            f"التاريخ: {date_txt}" if date_txt else "") if x]
+        add_par(doc, "   |   ".join(info), lang, "center", False, 10, after=8)
+
+    head("نتائج القسم")
+    widths = [0.45, 2.7, 0.9, 2.6]
+    t = make_table(doc, len(results) + 1, widths, lang)
+    for i, h in enumerate(["ر.ت", "الاسم واللقب", "العلامة", "الملاحظة"]):
+        cell_text(t.rows[0].cells[i], h, lang, 11, True)
+        shade(t.rows[0].cells[i])
+    for n, r in enumerate(results, 1):
+        vals = [str(n), r["student_name"], f"{r['score']:g}/{r['max_score']:g}", r["comment"]]
+        for i, v in enumerate(vals):
+            cell_text(t.rows[n].cells[i], v, lang, 10, False, "start" if i == 3 else "center")
+    sc = [r["score"] / r["max_score"] * 20 for r in results if r["max_score"]]
+    if sc:
+        spacer(doc, 8)
+        add_par(doc, f"المعدل /20: {sum(sc) / len(sc):.2f}   |   الأعلى: {max(sc):.2f}   |   الأدنى: {min(sc):.2f}", lang, "center", True, 11)
+
+    for r in results:
+        doc.add_page_break()
+        head(f"ورقة التلميذ(ة): {r['student_name']}")
+        add_par(doc, f"العلامة: {r['score']:g} / {r['max_score']:g}", lang, "start", True, 14, after=6)
+        if r.get("strengths"):
+            add_par(doc, "نقاط القوة", lang, "start", True, 12, after=2)
+            for x in r["strengths"]:
+                add_par(doc, "• " + x, lang, "start", False, 11, after=1)
+        if r.get("mistakes"):
+            spacer(doc, 4)
+            add_par(doc, "الأخطاء والتصويب", lang, "start", True, 12, after=2)
+            for mk in r["mistakes"]:
+                add_par(doc, f"• ({mk['category']}) {mk['description']}", lang, "start", False, 11, after=0)
+                add_par(doc, f"   التصويب: {mk['correction']}", lang, "start", False, 11, after=3)
+        spacer(doc, 4)
+        add_par(doc, "ملاحظة الأستاذ: " + r["comment"], lang, "start", False, 11)
+    return finish(doc)
+
+
+def docx_to_pdf(data):
+    """يحوّل Word إلى PDF إن كان LibreOffice متوفراً، وإلا يُرجع None."""
+    import shutil, subprocess, tempfile
+    exe = shutil.which("soffice") or shutil.which("libreoffice")
+    if not exe:
+        return None
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.docx")
+            open(src, "wb").write(data)
+            subprocess.run([exe, "--headless", "--convert-to", "pdf", "--outdir", d, src],
+                           check=True, timeout=120, capture_output=True)
+            return open(os.path.join(d, "r.pdf"), "rb").read()
+    except Exception:
+        log.exception("pdf convert")
+        return None
+
 # <<WORD-END>>
 
 # =====================================================================
@@ -805,6 +898,38 @@ def delete_chat(chat_id):
     conn.close()
 
 
+def delete_account_data(email):
+    conn = db()
+    ids = [r[0] for r in conn.execute("SELECT id FROM chats WHERE teacher=?", (email,)).fetchall()]
+    for cid in ids:
+        conn.execute("DELETE FROM messages WHERE chat_id=?", (cid,))
+        conn.execute("DELETE FROM drafts WHERE chat_id=?", (cid,))
+    conn.execute("DELETE FROM chats WHERE teacher=?", (email,))
+    conn.execute("DELETE FROM accounts WHERE email=?", (email,))
+    conn.commit()
+    conn.close()
+
+
+def admin_stats():
+    conn = db()
+    accs = conn.execute("SELECT email, used, created FROM accounts ORDER BY created DESC").fetchall()
+    n_chats = conn.execute("SELECT COUNT(*) FROM chats").fetchone()[0]
+    conn.close()
+    return accs, n_chats
+
+
+def friendly_error(e):
+    msg = str(e)
+    if "الخدمة غير متاحة" in msg:
+        return msg
+    low = msg.lower()
+    if "rate" in low or "429" in low or "quota" in low:
+        return "الخدمة مشغولة حالياً. انتظر دقيقة ثم أعد المحاولة."
+    if "timeout" in low or "connection" in low:
+        return "تعذّر الاتصال بالخدمة. تحقق من الإنترنت وأعد المحاولة."
+    return "حدث خطأ غير متوقع. أعد المحاولة، وإن تكرر فراسل الدعم."
+
+
 init_db()
 
 # =====================================================================
@@ -917,6 +1042,39 @@ def looks_like_refusal(text):
     return len(t) < 120 and bool(re.search(r"(لا أستطيع|آسف|عذراً|sorry|can't|cannot|unable)", t, re.I))
 
 
+def doc_to_text(name, data, limit=15000):
+    """يستخرج نص ملف Word/Excel/CSV/TXT/PDF. يُرجع "" إن لم يجد نصاً."""
+    ext = name.lower().rsplit(".", 1)[-1]
+    out = ""
+    try:
+        if ext == "docx":
+            d = Document(io.BytesIO(data))
+            parts = [p.text for p in d.paragraphs if p.text.strip()]
+            for t in d.tables:
+                for row in t.rows:
+                    parts.append(" | ".join(c.text.strip() for c in row.cells))
+            out = "\n".join(parts)
+        elif ext in ("xlsx", "xls"):
+            sheets = pd.read_excel(io.BytesIO(data), sheet_name=None, header=None)
+            out = "\n\n".join(f"[ورقة: {n}]\n" + df.fillna("").astype(str).apply(" | ".join, axis=1).str.cat(sep="\n")
+                               for n, df in sheets.items())
+        elif ext == "csv":
+            out = pd.read_csv(io.BytesIO(data), header=None).fillna("").astype(str).apply(" | ".join, axis=1).str.cat(sep="\n")
+        elif ext == "txt":
+            out = data.decode("utf-8", errors="ignore")
+        elif ext == "pdf":
+            from pypdf import PdfReader
+            out = "\n".join((pg.extract_text() or "") for pg in PdfReader(io.BytesIO(data)).pages)
+    except Exception:
+        log.exception("doc_to_text %s", name)
+        return ""
+    return out.strip()[:limit]
+
+
+def is_image_name(name):
+    return name.lower().rsplit(".", 1)[-1] in IMG_TYPES
+
+
 def ocr_image(b):
     r = llm(
         "vision", temperature=0, effort="low", max_out=3000,
@@ -931,10 +1089,12 @@ def ocr_image(b):
     return r.choices[0].message.content or ""
 
 
-def extract_style(images, kind_label):
+def extract_style(images, kind_label, texts=()):
     parts = [{"type": "text", "text": f"هذه صور لـ{kind_label} كتبها أستاذ. حلّل بنيتها وأسلوبها واكتب تعليمات موجزة بصيغة الأمر "
                                       "يستطيع مساعد آخر اتباعها ليكتب وثائق جديدة بنفس الطريقة: ترتيب الأقسام وعناوينها، نوع الأسئلة والأنشطة، "
                                       "توزيع النقاط، الصياغة والمصطلحات واللغة. لا تنقل محتوى الدرس نفسه، فقط الطريقة. في حدود 12 سطراً."}]
+    for t in texts:
+        parts.append({"type": "text", "text": "نص ملف مرفق:\n" + t})
     for b in images:
         parts.append({"type": "image_url", "image_url": {"url": data_url(shrink(b))}})
     r = llm("vision", [{"role": "user", "content": parts}], temperature=0.2, effort="low", max_out=1200)
@@ -1181,7 +1341,7 @@ def workshop(kind, placeholder, system_fn, turn_cls, temperature):
     with box:
         for m in st.session_state[mk]:
             render_message(m)
-    prompt = st.chat_input(placeholder, accept_file="multiple", file_type=IMG_TYPES, key=f"input_{kind}")
+    prompt = st.chat_input(placeholder, accept_file="multiple", file_type=IMG_TYPES + DOC_TYPES, key=f"input_{kind}")
     if not prompt:
         return
     if not require_credit():
@@ -1191,12 +1351,14 @@ def workshop(kind, placeholder, system_fn, turn_cls, temperature):
     if text is None:
         text = str(prompt)
     text = text.strip()
-    files = [shrink(f.getvalue()) for f in (getattr(prompt, "files", None) or [])]
+    _all = list(getattr(prompt, "files", None) or [])
+    files = [shrink(f.getvalue()) for f in _all if is_image_name(f.name)]
+    doc_texts = [(f.name, doc_to_text(f.name, f.getvalue())) for f in _all if not is_image_name(f.name)]
 
     chat_id = st.session_state[ik]
     owner = st.session_state.user["owner"]
     ensure_chat(chat_id, owner, kind)
-    maybe_set_title(chat_id, text or "صورة مرفقة")
+    maybe_set_title(chat_id, text or (doc_texts[0][0] if doc_texts else "صورة مرفقة"))
 
     user_msg = {"role": "user", "content": text, "images": files}
     st.session_state[mk].append(user_msg)
@@ -1209,6 +1371,13 @@ def workshop(kind, placeholder, system_fn, turn_cls, temperature):
         with st.chat_message("assistant"):
             with st.spinner("جاري العمل..."):
                 try:
+                    for dn, dt in doc_texts:
+                        if not dt:
+                            st.warning(f"تعذرت قراءة نص الملف «{dn}» (قد يكون ممسوحاً ضوئياً: صوّره كصور بدلاً من ذلك).")
+                            continue
+                        smsg = {"role": "source", "content": f"[ملف: {dn}]\n{dt}", "images": []}
+                        st.session_state[mk].append(smsg)
+                        save_message(chat_id, "source", smsg["content"])
                     for img in files:
                         src = ocr_image(img)
                         if looks_like_refusal(src) or not src.strip():
@@ -1220,7 +1389,7 @@ def workshop(kind, placeholder, system_fn, turn_cls, temperature):
                     turn = parse_structured(build_api_messages(st.session_state[mk], system_fn()), turn_cls, temperature)
                 except Exception as e:
                     log.exception("turn failed")
-                    st.error(f"حدث خطأ: {e}")
+                    st.error(friendly_error(e))
                     return
     reply = turn.reply.strip() or "تم."
     st.session_state[mk].append({"role": "assistant", "content": reply, "images": []})
@@ -1347,7 +1516,7 @@ def preview_exam(lang, meta, target, attach):
                     st.session_state.exam_b = b
                 except Exception as e:
                     log.exception("version B")
-                    st.error(f"حدث خطأ: {e}")
+                    st.error(friendly_error(e))
     b = st.session_state.get("exam_b")
     if b:
         d1, d2 = st.columns(2)
@@ -1373,6 +1542,17 @@ def email_box(key):
             st.rerun()
 
 
+PRIVACY_TEXT = """
+- يُرسَل نص طلباتك وصور الوثائق التي ترفعها إلى خدمة ذكاء اصطناعي خارجية (OpenAI) لمعالجتها فقط.
+- نحفظ بريدك وملفك البيداغوجي ومحادثاتك لتجدها لاحقاً، ولا نبيعها ولا نشاركها مع أي طرف.
+- قائمة أسماء القسم تُحفظ في جلستك فقط ولا تُرسَل للذكاء الاصطناعي إلا إذا اخترت أن يقرأ الاسم من الورقة. اختر «حسب ترتيب الرفع» لإبقاء الأسماء عندك. لا تُدخل معطيات حساسة أخرى عن التلاميذ.
+- مخرجات الذكاء الاصطناعي قد تحتوي أخطاء: راجع كل جذاذة وامتحان وعلامة قبل اعتمادها.
+- يمكنك في أي وقت حذف كل بياناتك من القائمة الجانبية (زر «احذف بياناتي»).
+- التطبيق في مرحلة تجريبية؛ قد تتغير الميزات والحدود.
+"""
+CONTACT_EMAIL = _setting("CONTACT_EMAIL", "")
+ADMIN_EMAIL = _setting("ADMIN_EMAIL", "").strip().lower()
+
 st.set_page_config(page_title="المساعد التربوي الذكي", page_icon="🎓", layout="wide")
 
 if "user" not in st.session_state:
@@ -1383,11 +1563,14 @@ if "user" not in st.session_state:
     c2.info("📝 **امتحانات**\n\nأجزاء ونقاط حسب طلبك، وورقة مؤطرة جاهزة للطباعة")
     c3.info("🔍 **تصحيح**\n\nارفع صور الأوراق واحصل على العلامات وجدول Excel")
     st.divider()
-    if st.button("🚀 جرّب الآن بدون تسجيل", type="primary", use_container_width=True):
-        st.session_state.user = {"email": None, "owner": "guest:" + str(uuid.uuid4()), "display": "الأستاذ(ة)"}
-        st.rerun()
-    st.markdown("**أو ادخل ببريدك الإلكتروني** (بدون كلمة سر) ليُحفظ ملفك وسجل محادثاتك:")
-    email_box("landing")
+    st.markdown("**ادخل ببريدك الإلكتروني** (بدون كلمة سر) ليُحفظ ملفك وسجل محادثاتك:")
+    with st.expander("🔒 سياسة الخصوصية والاستعمال"):
+        st.markdown(PRIVACY_TEXT)
+    consent = st.checkbox("قرأت سياسة الخصوصية وأوافق عليها، وأتحمّل مسؤولية استعمال أسماء التلاميذ وفق الضوابط المعمول بها في مؤسستي.", key="consent_ok")
+    if consent:
+        email_box("landing")
+    else:
+        st.caption("وافق على الشروط أعلاه لتتمكن من الدخول.")
     st.stop()
 
 user = st.session_state.user
@@ -1406,12 +1589,13 @@ with st.sidebar:
             st.session_state.clear()
             st.rerun()
     else:
-        st.caption("👤 زائر — لن يُحفظ ملفك. ادخل ببريدك لحفظه.")
+        st.caption("👤 زائر")
         if st.button("📧 دخول ببريدي", use_container_width=True):
             st.session_state.clear()
             st.rerun()
-    if LIMITS_ENABLED:
+    if LIMITS_ENABLED and user["email"]:
         st.metric("🎟️ المحاولات المتبقية", credits_left())
+    st.warning("⚠️ مخرجات الذكاء الاصطناعي قد تخطئ، راجعها قبل الاعتماد.")
 
     st.divider()
     st.subheader("📋 بيانات المادة")
@@ -1439,6 +1623,23 @@ with st.sidebar:
         row[0].button(f"{'📄' if kind == 'lesson' else '📝'} {c_title}", key=f"open_{c_id}", help=c_time,
                       on_click=load_chat, args=(c_id, kind), use_container_width=True)
         row[1].button("🗑", key=f"del_{c_id}", help="حذف", on_click=remove_chat, args=(c_id, kind))
+
+    if user["email"]:
+        st.divider()
+        with st.expander("🔒 الخصوصية وبياناتي"):
+            st.markdown(PRIVACY_TEXT)
+            if CONTACT_EMAIL:
+                st.caption(f"للدعم: {CONTACT_EMAIL}")
+            sure = st.checkbox("أؤكد حذف حسابي وكل محادثاتي نهائياً", key="confirm_delete")
+            if st.button("🗑 احذف بياناتي", disabled=not sure, use_container_width=True):
+                delete_account_data(user["email"])
+                st.session_state.clear()
+                st.rerun()
+        if ADMIN_EMAIL and user["email"] == ADMIN_EMAIL:
+            with st.expander("🛠 لوحة المشرف"):
+                accs, n_chats = admin_stats()
+                st.write(f"عدد الأساتذة: {len(accs)} — عدد المحادثات: {n_chats}")
+                st.dataframe(pd.DataFrame(accs, columns=["البريد", "الاستعمال", "التسجيل"]), use_container_width=True)
 
 # =====================================================================
 # التبويبات
@@ -1484,19 +1685,20 @@ def profile_ui():
 
     with st.expander("✨ قلّدني: ارفع وثيقة سابقة لك ليتعلّم التطبيق أسلوبك"):
         kind_label = st.radio("نوع الوثيقة", ["جذاذة", "امتحان"], horizontal=True, key="mimic_kind")
-        imgs = st.file_uploader("صور الوثيقة", type=IMG_TYPES, accept_multiple_files=True, key="mimic_files")
+        imgs = st.file_uploader("صور أو ملف الوثيقة (صور، Word، Excel، PDF)", type=IMG_TYPES + DOC_TYPES, accept_multiple_files=True, key="mimic_files")
         if st.button("🔍 حلّل أسلوبي", key="mimic_go"):
             if not imgs:
-                st.warning("ارفع صورة واحدة على الأقل.")
+                st.warning("ارفع ملفاً واحداً على الأقل.")
             else:
                 with st.spinner("جاري تحليل أسلوبك..."):
                     try:
-                        res = extract_style([f.getvalue() for f in imgs], kind_label)
+                        res = extract_style([f.getvalue() for f in imgs if is_image_name(f.name)], kind_label,
+                                            [t for t in (doc_to_text(f.name, f.getvalue()) for f in imgs if not is_image_name(f.name)) if t])
                         st.session_state["pending_method_" + ("lesson" if kind_label == "جذاذة" else "exam")] = res
                         st.rerun()
                     except Exception as e:
                         log.exception("mimic")
-                        st.error(f"حدث خطأ: {e}")
+                        st.error(friendly_error(e))
         st.caption("يُضاف الوصف إلى خانة «طريقتي» أعلاه لتراجعه وتعدّله قبل الحفظ.")
 
     if st.button("💾 حفظ ملفي", type="primary", key="save_profile"):
@@ -1559,9 +1761,64 @@ with tab_exam:
 with tab_grader:
     st.subheader("🔍 المصحح البيداغوجي الآلي (جماعي)")
     st.info("📸 ارفع صور أوراق عدة تلاميذ دفعة واحدة. ستحصل على جدول نتائج (Excel) وتحليل لأخطاء القسم.")
+
+    # ---- قائمة القسم (اختيارية) ----
+    def parse_roster(text, file):
+        names = []
+        if file is not None:
+            try:
+                dfr = pd.read_csv(file) if file.name.lower().endswith(".csv") else pd.read_excel(file)
+                col = next((c for c in dfr.columns if any(k in str(c).lower() for k in ("اسم", "name", "nom"))), dfr.columns[0])
+                names += [str(x).strip() for x in dfr[col].dropna()]
+            except Exception:
+                st.error("تعذرت قراءة الملف. استعمل Excel أو CSV يحوي عمود الأسماء.")
+        names += [x.strip() for x in (text or "").splitlines() if x.strip()]
+        seen, out = set(), []
+        for n in names:
+            if n not in seen:
+                seen.add(n); out.append(n)
+        return out
+
+    with st.expander("👥 قائمة أسماء القسم (اختياري) — لجدول النقط المطبوع", expanded=False):
+        st.caption("ارفع ملف Excel/CSV فيه عمود الأسماء، أو الصق الأسماء (اسم في كل سطر).")
+        rc1, rc2 = st.columns(2)
+        roster_file = rc1.file_uploader("ملف القسم", type=["xlsx", "csv"], key="roster_file")
+        roster_text = rc2.text_area("أو الصق الأسماء", key="roster_text", height=120)
+        st.text_input("اسم القسم (مثال: 7 أساسي 2)", key="class_name")
+        st.radio("كيف تُربط العلامات بالأسماء؟",
+                 ["يقرأ المساعد الاسم من الورقة ويطابقه مع القائمة",
+                  "حسب ترتيب رفع الأوراق (لا يُرسَل أي اسم للذكاء الاصطناعي)"],
+                 key="roster_mode")
+        _r = parse_roster(roster_text, roster_file)
+        if _r:
+            st.session_state.roster = _r
+        if st.session_state.get("roster"):
+            st.success(f"عدد التلاميذ في القائمة: {len(st.session_state.roster)}")
+    _roster = st.session_state.get("roster") or []
+    _by_order = bool(_roster) and str(st.session_state.get("roster_mode", "")).startswith("حسب")
+
+    def apply_roster(d, idx):
+        if not _roster:
+            return d
+        if _by_order:
+            if idx - 1 < len(_roster):
+                d["student_name"] = _roster[idx - 1]
+        else:
+            import difflib
+            hit = difflib.get_close_matches(d["student_name"], _roster, n=1, cutoff=0.6)
+            if hit:
+                d["student_name"] = hit[0]
+        return d
     draft = st.session_state.get("draft_exam")
     use_key = st.checkbox("استعمل سلّم إصلاح الامتحان الحالي", value=bool(draft), disabled=not draft, key="use_key")
     student_imgs = st.file_uploader("أوراق التلاميذ", type=IMG_TYPES, accept_multiple_files=True, key="student_files")
+    if student_imgs and len(student_imgs) > 40:
+        st.warning("الحد الأقصى 40 ورقة في كل مرة؛ سيُعالج أول 40 فقط.")
+        student_imgs = student_imgs[:40]
+    pages_per = st.number_input("عدد صفحات (صور) ورقة كل تلميذ", min_value=1, max_value=10, value=1, step=1, key="pages_per",
+                                help="1 = كل صورة تلميذ مختلف. ضع 5 مثلاً إن كان لكل تلميذ 5 صفحات: سترفعها مرتبة، وتُحسب كل 5 صور تلميذاً واحداً.")
+    if student_imgs and pages_per > 1:
+        st.caption(f"سيُصحَّح {math.ceil(len(student_imgs) / pages_per)} تلميذ(ة) من {len(student_imgs)} صورة. رتّب الصور بحيث تتتالى صفحات كل تلميذ.")
     grading_instructions = st.text_area("شروط التصحيح وسلّم التنقيط", "قم بتصحيح الأخطاء، واعط علامة مع ملاحظة مشجعة.", key="grading_text")
 
     if st.button("🚀 تصحيح الأوراق", type="primary", key="grade_go"):
@@ -1575,32 +1832,52 @@ with tab_grader:
                 instr += f"\n\nسلّم الإصلاح الرسمي:\n{key_text}"
                 max_note = f" العلامة القصوى {exam_total(draft):g}."
             results, bar = [], st.progress(0.0, text="بدء التصحيح...")
-            for i, f in enumerate(student_imgs, 1):
-                bar.progress((i - 1) / len(student_imgs), text=f"تصحيح الورقة {i}/{len(student_imgs)}: {f.name}")
+            _n = int(pages_per)
+            groups = [student_imgs[j:j + _n] for j in range(0, len(student_imgs), _n)]
+            for i, grp in enumerate(groups, 1):
+                f = grp[0]
+                bar.progress((i - 1) / len(groups), text=f"تصحيح الورقة {i}/{len(groups)}: {f.name}")
+                label = f"ورقة {i}" if _by_order else f.name
                 system = f"""أنت أستاذ ومفتش تربوي تونسي خبير في المادة ({prof('subject')}) والمستوى ({grade_label()}).
 حلّل ورقة التلميذ المرفقة بدقة:
-1. اقرأ اسم التلميذ (إن لم يظهر فاكتب اسم الملف: {f.name}) وانسخ إجابته.
+1. اقرأ اسم التلميذ (إن لم يظهر فاكتب: {label}) وانسخ إجابته.
 2. حدّد النقاط القوية.
 3. رصد الأخطاء وصنّفها (لغوي/مفهومي/تطبيقي/منهجي) مع التصويب.
 4. أعطِ علامة حسب التعليمات التالية: ({instr}).{max_note}
 5. اكتب ملاحظة بيداغوجية مشجعة."""
+                if len(grp) > 1:
+                    system += f"\n\nملاحظة مهمة: الصور المرفقة ({len(grp)}) هي صفحات ورقة تلميذ واحد بالترتيب. اعتبرها ورقة واحدة وأعطِ نتيجة واحدة لها. الاسم يظهر عادة في الصفحة الأولى."
                 try:
                     r = parse_structured(
                         [{"role": "system", "content": system},
-                         {"role": "user", "content": [{"type": "image_url", "image_url": {"url": data_url(shrink(f.getvalue()))}}]}],
+                         {"role": "user", "content": [{"type": "image_url", "image_url": {"url": data_url(shrink(g.getvalue()))}} for g in grp]}],
                         StudentResult, 0.2, kind="vision")
-                    results.append(r.model_dump())
+                    results.append(apply_roster(r.model_dump(), i))
                 except Exception as e:
                     log.exception("grading %s", f.name)
-                    st.error(f"تعذر تصحيح {f.name}: {e}")
+                    st.error(f"تعذر تصحيح {f.name}. جرّب صورة أوضح.")
             bar.progress(1.0, text="اكتمل التصحيح")
             st.session_state.grades = results
+            st.session_state.grades_ver = st.session_state.get("grades_ver", 0) + 1
             st.session_state.pop("class_analysis", None)
 
     results = st.session_state.get("grades")
     if results:
         df = pd.DataFrame([{"التلميذ": r["student_name"], "العلامة": r["score"], "من": r["max_score"], "الملاحظة": r["comment"]} for r in results])
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.caption("✏️ يمكنك تعديل العلامة أو الاسم أو الملاحظة لأي تلميذ مباشرة في الجدول قبل التصدير.")
+        _ed = st.data_editor(
+            df, use_container_width=True, hide_index=True, key=f"grades_editor_{st.session_state.get('grades_ver', 0)}",
+            column_config={"العلامة": st.column_config.NumberColumn(min_value=0.0, step=0.25),
+                           "من": st.column_config.NumberColumn(min_value=0.0, step=1.0)})
+        for _r, _row in zip(results, _ed.to_dict("records")):
+            try:
+                _r["student_name"] = str(_row["التلميذ"])
+                _r["score"] = float(_row["العلامة"])
+                _r["max_score"] = float(_row["من"])
+                _r["comment"] = str(_row["الملاحظة"])
+            except (TypeError, ValueError):
+                pass
+        df = pd.DataFrame([{"التلميذ": r["student_name"], "العلامة": r["score"], "من": r["max_score"], "الملاحظة": r["comment"]} for r in results])
         scores20 = [r["score"] / r["max_score"] * 20 for r in results if r["max_score"]]
         if scores20:
             m1, m2, m3 = st.columns(3)
@@ -1614,6 +1891,42 @@ with tab_grader:
             pd.DataFrame([{"التلميذ": r["student_name"], "نوع الخطأ": mk["category"], "الخطأ": mk["description"], "التصويب": mk["correction"]}
                           for r in results for mk in r["mistakes"]]).to_excel(w, index=False, sheet_name="الأخطاء")
         st.download_button("⬇️ تحميل جدول النتائج (Excel)", xbio.getvalue(), f"Resultats_{safe_name(prof('subject'))}.xlsx", XLSX_MIME)
+
+        # ---- كشف النقط المطبوع ----
+        by_name = {r["student_name"]: r for r in results}
+        order = list(_roster) + [n for n in by_name if n not in _roster]
+        rows_p = []
+        for n in order:
+            r = by_name.get(n)
+            rows_p.append({"name": n, "score": r["score"] if r else None, "max": r["max_score"] if r else 0,
+                           "comment": r["comment"] if r else ""})
+        pc1, pc2 = st.columns(2)
+        pc1.download_button("🖨️ كشف النقط للطباعة (Word)",
+                            create_grades_doc(rows_p, prof("language"), doc_meta(), st.session_state.get("class_name", ""),
+                                              datetime.now().strftime("%d/%m/%Y")).getvalue(),
+                            f"Kachf_{safe_name(prof('subject'))}.docx", DOCX_MIME, use_container_width=True)
+        xb2 = io.BytesIO()
+        pd.DataFrame([{"ر.ت": i, "الاسم واللقب": r["name"], "القسم": st.session_state.get("class_name", ""),
+                       "المادة": prof("subject"), "المعهد": prof("school"),
+                       "العلامة": r["score"] if r["score"] is not None else "",
+                       "من": r["max"] or "", "الملاحظة": r["comment"]} for i, r in enumerate(rows_p, 1)]
+                     ).to_excel(xb2, index=False, sheet_name="كشف النقط")
+        pc2.download_button("⬇️ كشف النقط (Excel)", xb2.getvalue(), f"Kachf_{safe_name(prof('subject'))}.xlsx",
+                            XLSX_MIME, use_container_width=True)
+
+        # ---- تقرير القسم الكامل (Word / PDF) ----
+        st.text_input("عنوان الامتحان (يظهر في التقرير)", key="exam_title_g", placeholder="مثال: فرض مراقبة عدد 1")
+        _rep = create_class_report_doc(results, prof("language"), doc_meta(), st.session_state.get("class_name", ""),
+                                       st.session_state.get("exam_title_g", ""), datetime.now().strftime("%d/%m/%Y")).getvalue()
+        rc1_, rc2_ = st.columns(2)
+        rc1_.download_button("📑 تقرير القسم كاملاً (Word)", _rep, f"Rapport_{safe_name(prof('subject'))}.docx",
+                             DOCX_MIME, use_container_width=True)
+        _pdf = docx_to_pdf(_rep)
+        if _pdf:
+            rc2_.download_button("📕 تقرير القسم كاملاً (PDF)", _pdf, f"Rapport_{safe_name(prof('subject'))}.pdf",
+                                 "application/pdf", use_container_width=True)
+        else:
+            rc2_.caption("لتحويله إلى PDF: افتح ملف Word ثم «حفظ باسم» ← PDF.")
 
         for i, r in enumerate(results):
             with st.expander(f"📄 {r['student_name']} — {r['score']:g}/{r['max_score']:g}"):
@@ -1639,6 +1952,6 @@ with tab_grader:
                         st.session_state.class_analysis = resp.choices[0].message.content
                     except Exception as e:
                         log.exception("class analysis")
-                        st.error(f"حدث خطأ: {e}")
+                        st.error(friendly_error(e))
         if st.session_state.get("class_analysis"):
             st.markdown(st.session_state.class_analysis)

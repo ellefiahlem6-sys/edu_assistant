@@ -8,3 +8,5 @@ pillow
 matplotlib
 arabic-reshaper
 python-bidi
+pypdf
+psycopg2-binary
