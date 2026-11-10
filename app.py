@@ -279,7 +279,18 @@ def make_table(doc, rows, widths, lang, grid=True):
     return t
 
 
+ACCENT_COLORS = {"أزرق": ("1F4E79", "DCE9F5"), "أخضر": ("2E6B3A", "DDEFE0"), "بنفسجي": ("5B3A8C", "E8E0F3"),
+                 "برتقالي": ("B35C00", "FBE8D0"), "أحمر": ("9B2C2C", "F6DCDC"), "رمادي": ("404040", "E7E6E6")}
+ACCENT = {"name": None}
+
+
+def set_accent(name):
+    ACCENT["name"] = name if name in ACCENT_COLORS else None
+
+
 def shade(cell, fill="E7E6E6"):
+    if ACCENT["name"] and fill in ("E7E6E6", "F2F2F2"):
+        fill = ACCENT_COLORS[ACCENT["name"]][1]
     tcPr = cell._tc.get_or_add_tcPr()
     shd = OxmlElement("w:shd")
     shd.set(qn("w:val"), "clear")
@@ -456,7 +467,7 @@ def add_page_border(doc):
             b.set(qn("w:val"), "double")
             b.set(qn("w:sz"), "12")
             b.set(qn("w:space"), "24")
-            b.set(qn("w:color"), "000000")
+            b.set(qn("w:color"), ACCENT_COLORS[ACCENT["name"]][0] if ACCENT["name"] else "000000")
             pg.append(b)
         # مخطط Word يشترط أن يأتي pgBorders بعد pgMar مباشرة
         pgMar = sectPr.find(qn("w:pgMar"))
@@ -669,8 +680,8 @@ def create_lesson_doc(data, lang, m, images=None):
 
 
 
-def create_grades_doc(rows, lang, m, class_name="", date_txt="", title="كشف النقط"):
-    """rows: list of dicts {name, score, max, comment}. جدول مؤطر جاهز للطباعة."""
+def create_grades_doc(rows, lang, m, class_name="", date_txt="", title="جدول النقط", show_note=False, stats=True):
+    """rows: list of dicts {name, score, max, comment}. جدول مؤطر بسيط جاهز للطباعة."""
     doc = new_doc()
     add_par(doc, title, lang, "center", True, 16, after=6)
     info = [x for x in (
@@ -680,17 +691,23 @@ def create_grades_doc(rows, lang, m, class_name="", date_txt="", title="كشف �
         f"القسم: {class_name}" if class_name else "",
         f"التاريخ: {date_txt}" if date_txt else "") if x]
     add_par(doc, "   |   ".join(info), lang, "center", False, 11, after=8)
-    widths = [0.45, 2.4, 0.9, 2.9]
+    heads = ["ر.ت", "الاسم واللقب", "العلامة"] + (["الملاحظة"] if show_note else [])
+    widths = ([0.6, 3.0, 1.2, 1.8] if show_note else [0.7, 4.3, 1.6])
     t = make_table(doc, len(rows) + 1, widths, lang)
-    for i, h in enumerate(["ر.ت", "الاسم واللقب", "العلامة", "الملاحظة"]):
+    for i, h in enumerate(heads):
         cell_text(t.rows[0].cells[i], h, lang, 11, True)
         shade(t.rows[0].cells[i])
     for n, r in enumerate(rows, 1):
         sc = r.get("score")
         mark = "" if sc in (None, "") else f"{sc:g}/{r['max']:g}"
-        vals = [str(n), r.get("name", ""), mark, r.get("comment", "")]
+        vals = [str(n), r.get("name", ""), mark] + ([r.get("comment", "")] if show_note else [])
         for i, v in enumerate(vals):
             cell_text(t.rows[n].cells[i], v, lang, 10, False, "start" if i == 3 else "center")
+    if stats:
+        sc20 = [r["score"] / r["max"] * 20 for r in rows if r.get("score") not in (None, "") and r.get("max")]
+        if sc20:
+            spacer(doc, 8)
+            add_par(doc, f"المعدل /20: {sum(sc20) / len(sc20):.2f}   |   الأعلى: {max(sc20):.2f}   |   الأدنى: {min(sc20):.2f}", lang, "center", True, 11)
     return finish(doc)
 
 
@@ -1259,7 +1276,7 @@ PRESETS = {
 PROFILE_DEFAULTS = {
     "name": "", "school": "المعهد الثانوي", "cycle": "إعدادي وثانوي", "grade": "السابعة أساسي", "section": SECTION_NONE,
     "subject": "", "language": "العربية", "creativity": 0.7,
-    "method_lesson": "", "method_exam": "", "notes": "",
+    "method_lesson": "", "method_exam": "", "method_grading": "", "notes": "",
 }
 
 
@@ -1501,6 +1518,18 @@ def chat_images(kind):
     return [b for m in st.session_state[f"messages_{kind}"] for b in m.get("images", [])]
 
 
+def accent_for(kind):
+    if st.session_state.get(f"{kind}_color_on"):
+        return st.session_state.get(f"{kind}_color_name")
+    return None
+
+
+def color_picker_ui(kind):
+    on = st.checkbox("🎨 ألوان (اختياري)", key=f"{kind}_color_on", help="يلوّن الإطار ورؤوس الجداول والعناوين. أبقه مطفأً للطباعة بالأبيض والأسود.")
+    if on:
+        st.selectbox("اللون", list(ACCENT_COLORS), key=f"{kind}_color_name")
+
+
 def preview_lesson(lang, attach):
     d = st.session_state.get("draft_lesson")
     if not d:
@@ -1512,6 +1541,7 @@ def preview_lesson(lang, attach):
     for b in d["lesson_blocks"]:
         with st.expander(b["heading"], expanded=True):
             st.markdown(b["content"])
+    set_accent(accent_for("lesson"))
     data = create_lesson_doc(d, lang, doc_meta(), chat_images("lesson") if attach else None).getvalue()
     st.download_button("⬇️ تحميل الجذاذة (Word)", data, f"Jadhatha_{safe_name(prof('subject'))}_{safe_name(grade_label())}.docx",
                        DOCX_MIME, type="primary", use_container_width=True)
@@ -1590,6 +1620,7 @@ def preview_exam(lang, meta, target, attach):
     imgs = chat_images("exam") if attach else None
     base = f"{safe_name(prof('subject'))}_{safe_name(grade_label())}"
     c1, c2 = st.columns(2)
+    set_accent(accent_for("exam"))
     c1.download_button("⬇️ ورقة الامتحان", create_exam_doc(d, lang, meta, imgs).getvalue(), f"Examen_{base}.docx",
                        DOCX_MIME, type="primary", use_container_width=True)
     c2.download_button("⬇️ ملف الإصلاح (للأستاذ)", create_answer_key_doc(d, lang, meta).getvalue(), f"Corrige_{base}.docx",
@@ -1776,6 +1807,7 @@ def profile_ui():
     for kind, label, ph in (
         ("lesson", "طريقتي في تحضير الدرس", "مثال: أبدأ بوضعية انطلاق، ثم سند ووثيقة، ثم أنشطة، وأختم بتقييم من 3 أسئلة."),
         ("exam", "طريقتي في بناء الامتحان", "مثال: جزء للمعرفة (8 ن)، جزء للتطبيق (8 ن)، ووضعية إدماجية (4 ن)."),
+        ("grading", "طريقتي في التصحيح", "مثال: أخصم نصف نقطة على الإملاء، ولا أعطي العلامة كاملة دون تعليل، وأحتسب المنهجية."),
     ):
         replace = st.session_state.pop(f"replace_method_{kind}", None)
         if replace:
@@ -1828,6 +1860,7 @@ with tab_lesson:
         st.caption(f"المادة: {prof('subject') or '—'}  \nالمستوى: {grade_label()}  \nاللغة: {LANG}")
         st.caption("تُغيَّر من القائمة الجانبية 👈")
         lesson_attach = st.checkbox("إرفاق صور المحادثة كملحق", key="lesson_attach")
+        color_picker_ui("lesson")
         st.download_button(
             "📄 تصدير الحوار (.txt)",
             "\n\n".join(f"[{m['role']}]: {m['content']}" for m in st.session_state.messages_lesson if m.get("content")),
@@ -1851,6 +1884,7 @@ with tab_exam:
         ex_date = st.date_input("التاريخ", datetime.now(), key="ex_date").strftime("%d/%m/%Y")
         ex_total = st.number_input("المجموع", min_value=1.0, max_value=100.0, value=20.0, step=1.0, key="ex_total")
         exam_attach = st.checkbox("إرفاق صور المحادثة كملحق", key="exam_attach")
+        color_picker_ui("exam")
     exam_title = ex_custom.strip() or ex_type
     meta = doc_meta() | {"exam_title": exam_title, "duration": ex_duration, "date": ex_date, "total": float(ex_total)}
     with c_chat:
@@ -1958,15 +1992,36 @@ with tab_grader:
     if _sel:
         draft = st.session_state.get("draft_exam") if _sel[0] == "current" else load_draft(_sel[1])
     use_key = bool(draft)
-    no_key_ok = True
-    if not draft:
-        no_key_ok = st.checkbox("أصحّح دون سلّم إصلاح (دقة أقل: يقدّر المساعد الإجابات بنفسه)", key="no_key_ok")
     if draft:
         st.caption(f"سيُصحَّح على سلّم إصلاح هذا الامتحان (العلامة القصوى {exam_total(draft):g}).")
+    barem_text = st.text_area("📋 أو ألصق البارم / الإصلاح الذي تريد التصحيح عليه (اختياري)", key="barem_text", height=100,
+                              placeholder="مثال: س1 (4 ن): التعريف ... / س2 (6 ن): ...")
+    barem_file = st.file_uploader("أو ارفع البارم (Word، Excel، PDF، صورة)", type=IMG_TYPES + DOC_TYPES, key="barem_file")
+    _bf_text = ""
+    if barem_file:
+        _bk = (barem_file.name, getattr(barem_file, "size", 0))
+        _cache = st.session_state.get("_barem_cache")
+        if _cache and _cache[0] == _bk:
+            _bf_text = _cache[1]
+        else:
+            try:
+                if is_image_name(barem_file.name):
+                    _bf_text = ocr_image(shrink(barem_file.getvalue())) or ""
+                else:
+                    _bf_text = doc_to_text(barem_file.name, barem_file.getvalue())
+            except Exception:
+                log.exception("barem read")
+                st.warning("تعذرت قراءة ملف البارم. ألصق نصه في الخانة أعلاه.")
+            st.session_state["_barem_cache"] = (_bk, _bf_text)
+    barem = (str(barem_text or "").strip() + "\n" + _bf_text).strip()
+    no_key_ok = True
+    if not draft and not barem:
+        no_key_ok = st.checkbox("أصحّح دون بارم (دقة أقل: يقدّر المساعد الإجابات بنفسه)", key="no_key_ok")
 
     # ---- 2) أوراق التلاميذ ----
-    grade_mode = st.radio("طريقة إضافة الأوراق", ["تلميذ بتلميذ (الأسهل)", "دفعة واحدة (صور مرتبة)"],
-                          horizontal=True, key="grade_mode")
+    with st.expander("⚙️ خيارات متقدمة: رفع دفعة واحدة"):
+        grade_mode = st.radio("طريقة إضافة الأوراق", ["تلميذ بتلميذ (الأسهل)", "دفعة واحدة (صور مرتبة)"],
+                              horizontal=True, key="grade_mode")
     batch = not str(grade_mode).startswith("تلميذ")
     groups_in = []
     if not batch:
@@ -2026,8 +2081,8 @@ with tab_grader:
     if st.button("🚀 تصحيح الأوراق", type="primary", key="grade_go"):
         if not groups_in:
             st.warning("⚠️ الرجاء رفع ورقة واحدة على الأقل.")
-        elif not draft and not no_key_ok:
-            st.warning("⚠️ اختر الامتحان ليُصحَّح على سلّم إصلاحه، أو أكّد التصحيح دون سلّم.")
+        elif not draft and not barem and not no_key_ok:
+            st.warning("⚠️ اختر الامتحان أو ضع البارم ليُصحَّح عليه، أو أكّد التصحيح دون بارم.")
         elif require_credit(_total_imgs):
             instr, max_note = grading_instructions, ""
             if use_key and draft:
@@ -2035,11 +2090,14 @@ with tab_grader:
                                      for i, (_, q) in enumerate(all_questions(draft), 1))
                 instr += f"\n\nسلّم الإصلاح الرسمي:\n{key_text}"
                 max_note = f" العلامة القصوى {exam_total(draft):g}."
+            if barem:
+                instr += f"\n\nالبارم / الإصلاح الذي قدّمه الأستاذ (التزم به حرفياً في توزيع العلامات):\n{barem}"
             results, bar = [], st.progress(0.0, text="بدء التصحيح...")
             for i, (grp, nm) in enumerate(groups_in, 1):
                 f = grp[0]
                 bar.progress((i - 1) / len(groups_in), text=f"تصحيح الورقة {i}/{len(groups_in)}: {nm or f.name}")
                 label = f"ورقة {i}" if (nm or (batch and _by_order)) else f.name
+                _gm = ("\nطريقة الأستاذ في التصحيح (التزم بها): " + prof("method_grading").strip()) if prof("method_grading").strip() else ""
                 system = f"""أنت أستاذ ومفتش تربوي تونسي خبير في المادة ({prof('subject')}) والمستوى ({grade_label()}).
 حلّل ورقة التلميذ المرفقة بدقة:
 1. اقرأ اسم التلميذ (إن لم يظهر فاكتب: {label}) وانسخ إجابته.
@@ -2047,14 +2105,15 @@ with tab_grader:
 3. رصد الأخطاء وصنّفها (لغوي/مفهومي/تطبيقي/منهجي) مع التصويب.
 4. أعطِ علامة حسب التعليمات التالية: ({instr}).{max_note}
    سجّل في الحقل questions علامة كل سؤال على حدة (رقم السؤال، العلامة، العلامة القصوى، ملاحظة قصيرة){" بنفس ترتيب أسئلة سلّم الإصلاح وعلاماتها القصوى" if use_key and draft else " بعد تقسيم الورقة إلى أسئلة"}. كن موضوعياً ولا تتساهل. والعلامة الكلية هي مجموع علامات الأسئلة.
-5. اكتب ملاحظة بيداغوجية مشجعة."""
+5. اكتب ملاحظة بيداغوجية قصيرة وصادقة.
+قواعد التصحيح: صحّح كأستاذ صارم وعادل؛ لا تقرّب العلامة إلى الأعلى؛ لا تمنح العلامة كاملة إلا لإجابة صحيحة كاملة؛ اخصم على كل خطأ ولو جزئياً؛ لا تتأثر بجمال الخط أو طول الإجابة؛ إن تعذّرت قراءة جزء فاذكر ذلك في الملاحظة ولا تفترض صحته.{_gm}"""
                 if len(grp) > 1:
                     system += f"\n\nملاحظة مهمة: الصور المرفقة ({len(grp)}) هي صفحات ورقة تلميذ واحد بالترتيب. اعتبرها ورقة واحدة وأعطِ نتيجة واحدة لها. الاسم يظهر عادة في الصفحة الأولى."
                 try:
                     r = parse_structured(
                         [{"role": "system", "content": system},
                          {"role": "user", "content": [{"type": "image_url", "image_url": {"url": data_url(shrink(g.getvalue()))}} for g in grp]}],
-                        StudentResult, 0.2, kind="vision")
+                        StudentResult, 0.0, kind="vision")
                     d_ = r.model_dump()
                     _qs = d_.get("questions") or []
                     if _qs:
@@ -2128,15 +2187,42 @@ with tab_grader:
             m2.metric("أعلى علامة /20", f"{max(scores20):.2f}")
             m3.metric("أدنى علامة /20", f"{min(scores20):.2f}")
 
-        xbio = io.BytesIO()
-        with pd.ExcelWriter(xbio, engine="openpyxl") as w:
-            df.to_excel(w, index=False, sheet_name="النتائج")
-            pd.DataFrame([{"التلميذ": r["student_name"], "نوع الخطأ": mk["category"], "الخطأ": mk["description"], "التصويب": mk["correction"]}
-                          for r in results for mk in r["mistakes"]]).to_excel(w, index=False, sheet_name="الأخطاء")
-        st.download_button("⬇️ تحميل جدول النتائج (Excel)", xbio.getvalue(), f"Resultats_{safe_name(prof('subject'))}.xlsx", XLSX_MIME)
+        st.markdown("### 📥 جدول النقط")
+        by_name = {r["student_name"]: r for r in results}
+        order = list(_roster) + [n for n in by_name if n not in _roster]
+        rows_p = []
+        for n in order:
+            r = by_name.get(n)
+            rows_p.append({"name": n, "score": r["score"] if r else None, "max": r["max_score"] if r else 0,
+                           "comment": r["comment"] if r else ""})
+        if complete:
+            _word = create_grades_doc(rows_p, prof("language"), doc_meta(), st.session_state.get("class_name", ""),
+                                      datetime.now().strftime("%d/%m/%Y")).getvalue()
+            sc1, sc2, sc3 = st.columns(3)
+            sc1.download_button("📄 تحميل (Word)", _word, f"Notes_{safe_name(prof('subject'))}.docx", DOCX_MIME, use_container_width=True)
+            _spdf = docx_to_pdf(_word)
+            if _spdf:
+                sc2.download_button("📕 تحميل (PDF)", _spdf, f"Notes_{safe_name(prof('subject'))}.pdf", "application/pdf", use_container_width=True)
+            else:
+                sc2.caption("لـ PDF: افتح ملف Word ثم «حفظ باسم» ← PDF.")
+            xb3 = io.BytesIO()
+            pd.DataFrame([{"ر.ت": i, "الاسم واللقب": r["name"], "القسم": st.session_state.get("class_name", ""),
+                           "المادة": prof("subject"), "الأستاذ": doc_meta()["teacher"],
+                           "العلامة": r["score"] if r["score"] is not None else "", "من": r["max"] or ""}
+                          for i, r in enumerate(rows_p, 1)]).to_excel(xb3, index=False, sheet_name="النقط")
+            sc3.download_button("⬇️ تحميل (Excel)", xb3.getvalue(), f"Notes_{safe_name(prof('subject'))}.xlsx", XLSX_MIME, use_container_width=True)
+        else:
+            st.caption("يظهر الجدول للتحميل بعد اكتمال تصحيح القسم.")
 
-        # ---- كشف النقط المطبوع (خيار إضافي) ----
-        with st.expander("🖨️ خيارات إضافية: كشف نقط مبسّط"):
+        with st.expander("📂 تفاصيل وتقارير إضافية"):
+            xbio = io.BytesIO()
+            with pd.ExcelWriter(xbio, engine="openpyxl") as w:
+                df.to_excel(w, index=False, sheet_name="النتائج")
+                pd.DataFrame([{"التلميذ": r["student_name"], "نوع الخطأ": mk["category"], "الخطأ": mk["description"], "التصويب": mk["correction"]}
+                              for r in results for mk in r["mistakes"]]).to_excel(w, index=False, sheet_name="الأخطاء")
+            st.download_button("⬇️ تحميل جدول النتائج (Excel)", xbio.getvalue(), f"Resultats_{safe_name(prof('subject'))}.xlsx", XLSX_MIME)
+
+
             by_name = {r["student_name"]: r for r in results}
             order = list(_roster) + [n for n in by_name if n not in _roster]
             rows_p = []
@@ -2158,49 +2244,50 @@ with tab_grader:
             pc2.download_button("⬇️ كشف النقط (Excel)", xb2.getvalue(), f"Kachf_{safe_name(prof('subject'))}.xlsx",
                                 XLSX_MIME, use_container_width=True)
 
-        # ---- تقرير القسم الكامل (Word / PDF) ----
-        if complete:
-            st.text_input("عنوان الامتحان (يظهر في التقرير)", key="exam_title_g", placeholder="مثال: فرض مراقبة عدد 1")
-            _rep = create_class_report_doc(results, prof("language"), doc_meta(), st.session_state.get("class_name", ""),
-                                           st.session_state.get("exam_title_g", ""), datetime.now().strftime("%d/%m/%Y")).getvalue()
-            rc1_, rc2_ = st.columns(2)
-            rc1_.download_button("📑 تقرير القسم كاملاً (Word)", _rep, f"Rapport_{safe_name(prof('subject'))}.docx",
-                                 DOCX_MIME, use_container_width=True)
-            _pdf = docx_to_pdf(_rep)
-            if _pdf:
-                rc2_.download_button("📕 تقرير القسم كاملاً (PDF)", _pdf, f"Rapport_{safe_name(prof('subject'))}.pdf",
-                                     "application/pdf", use_container_width=True)
-            else:
-                rc2_.caption("لتحويله إلى PDF: افتح ملف Word ثم «حفظ باسم» ← PDF.")
+            # ---- تقرير القسم الكامل (Word / PDF) ----
+            if complete:
+                st.text_input("عنوان الامتحان (يظهر في التقرير)", key="exam_title_g", placeholder="مثال: فرض مراقبة عدد 1")
+                _rep = create_class_report_doc(results, prof("language"), doc_meta(), st.session_state.get("class_name", ""),
+                                               st.session_state.get("exam_title_g", ""), datetime.now().strftime("%d/%m/%Y")).getvalue()
+                rc1_, rc2_ = st.columns(2)
+                rc1_.download_button("📑 تقرير القسم كاملاً (Word)", _rep, f"Rapport_{safe_name(prof('subject'))}.docx",
+                                     DOCX_MIME, use_container_width=True)
+                _pdf = docx_to_pdf(_rep)
+                if _pdf:
+                    rc2_.download_button("📕 تقرير القسم كاملاً (PDF)", _pdf, f"Rapport_{safe_name(prof('subject'))}.pdf",
+                                         "application/pdf", use_container_width=True)
+                else:
+                    rc2_.caption("لتحويله إلى PDF: افتح ملف Word ثم «حفظ باسم» ← PDF.")
 
 
-        for i, r in enumerate(results):
-            with st.expander(f"📄 {r['student_name']} — {r['score']:g}/{r['max_score']:g}"):
-                if r.get("questions"):
-                    st.dataframe(pd.DataFrame([{"السؤال": q["number"], "العلامة": q["score"], "من": q["max_score"], "ملاحظة": q["note"]}
-                                               for q in r["questions"]]), hide_index=True, use_container_width=True)
-                if r["strengths"]:
-                    st.markdown("**✅ نقاط القوة:** " + "؛ ".join(r["strengths"]))
-                for mk in r["mistakes"]:
-                    st.markdown(f"- ❌ ({mk['category']}) {mk['description']}  \n  ✔️ {mk['correction']}")
-                st.info(r["comment"])
+            for i, r in enumerate(results):
+                with st.container(border=True):
+                    st.markdown(f"**📄 {r['student_name']} — {r['score']:g}/{r['max_score']:g}**")
+                    if r.get("questions"):
+                        st.dataframe(pd.DataFrame([{"السؤال": q["number"], "العلامة": q["score"], "من": q["max_score"], "ملاحظة": q["note"]}
+                                                   for q in r["questions"]]), hide_index=True, use_container_width=True)
+                    if r["strengths"]:
+                        st.markdown("**✅ نقاط القوة:** " + "؛ ".join(r["strengths"]))
+                    for mk in r["mistakes"]:
+                        st.markdown(f"- ❌ ({mk['category']}) {mk['description']}  \n  ✔️ {mk['correction']}")
+                    st.info(r["comment"])
 
-        if st.button("🧠 تحليل أخطاء القسم واقتراح حصة علاج", key="analyze"):
-            if require_credit():
-                with st.spinner("جاري التحليل..."):
-                    try:
-                        summary = "\n".join(f"- ({mk['category']}) {mk['description']}" for r in results for mk in r["mistakes"])
-                        resp = llm(
-                            "text", temperature=0.4,
-                            messages=[{"role": "user", "content": f"""أنت مفتش تربوي. هذه أخطاء تلاميذ قسم في {prof('subject')} ({grade_label()}):
-{summary}
+            if st.button("🧠 تحليل أخطاء القسم واقتراح حصة علاج", key="analyze"):
+                if require_credit():
+                    with st.spinner("جاري التحليل..."):
+                        try:
+                            summary = "\n".join(f"- ({mk['category']}) {mk['description']}" for r in results for mk in r["mistakes"])
+                            resp = llm(
+                                "text", temperature=0.4,
+                                messages=[{"role": "user", "content": f"""أنت مفتش تربوي. هذه أخطاء تلاميذ قسم في {prof('subject')} ({grade_label()}):
+    {summary}
 
-1) لخّص أكثر الأخطاء تكراراً مرتبة حسب النسبة التقريبية.
-2) حدّد الأسباب المحتملة.
-3) اقترح حصة علاج مفصلة (الأهداف، الأنشطة، التمارين، التقييم) في حدود 45 دقيقة."""}])
-                        st.session_state.class_analysis = resp.choices[0].message.content
-                    except Exception as e:
-                        log.exception("class analysis")
-                        st.error(friendly_error(e))
-        if st.session_state.get("class_analysis"):
-            st.markdown(st.session_state.class_analysis)
+    1) لخّص أكثر الأخطاء تكراراً مرتبة حسب النسبة التقريبية.
+    2) حدّد الأسباب المحتملة.
+    3) اقترح حصة علاج مفصلة (الأهداف، الأنشطة، التمارين، التقييم) في حدود 45 دقيقة."""}])
+                            st.session_state.class_analysis = resp.choices[0].message.content
+                        except Exception as e:
+                            log.exception("class analysis")
+                            st.error(friendly_error(e))
+            if st.session_state.get("class_analysis"):
+                st.markdown(st.session_state.class_analysis)
