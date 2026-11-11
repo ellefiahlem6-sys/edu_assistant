@@ -38,7 +38,7 @@ GUEST_FREE = 0
 MEMBER_FREE = 30
 
 IMG_TYPES = ["png", "jpg", "jpeg"]
-DOC_TYPES = ["docx", "xlsx", "csv", "txt", "pdf"]
+DOC_TYPES = ["docx", "xlsx", "xls", "csv", "txt", "pdf", "pptx"]
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
@@ -1173,6 +1173,14 @@ def doc_to_text(name, data, limit=15000):
         elif ext == "pdf":
             from pypdf import PdfReader
             out = "\n".join((pg.extract_text() or "") for pg in PdfReader(io.BytesIO(data)).pages)
+        elif ext == "pptx":
+            from pptx import Presentation
+            parts = []
+            for sl in Presentation(io.BytesIO(data)).slides:
+                for sh in sl.shapes:
+                    if getattr(sh, "has_text_frame", False) and sh.text_frame.text.strip():
+                        parts.append(sh.text_frame.text)
+            out = "\n".join(parts)
     except Exception:
         log.exception("doc_to_text %s", name)
         return ""
@@ -1181,6 +1189,85 @@ def doc_to_text(name, data, limit=15000):
 
 def is_image_name(name):
     return name.lower().rsplit(".", 1)[-1] in IMG_TYPES
+
+
+class PageImg:
+    """صفحة صورة مأخوذة من ملف PDF، بنفس واجهة الملف المرفوع."""
+
+    def __init__(self, name, data):
+        self.name, self._b = name, data
+
+    def getvalue(self):
+        return self._b
+
+
+def pdf_pages_png(data, max_pages=8):
+    """يحوّل صفحات PDF إلى صور PNG (يحتاج مكتبة pymupdf)."""
+    try:
+        import fitz
+        out = []
+        with fitz.open(stream=data, filetype="pdf") as d:
+            for i, pg in enumerate(d):
+                if i >= max_pages:
+                    break
+                out.append(pg.get_pixmap(dpi=130).tobytes("png"))
+        return out
+    except Exception:
+        log.exception("pdf render")
+        return []
+
+
+def expand_pages(files):
+    """يحوّل أي PDF في القائمة إلى صفحات صور، ويُبقي الصور كما هي."""
+    out = []
+    for f in files:
+        if f.name.lower().endswith(".pdf"):
+            for k, b in enumerate(pdf_pages_png(f.getvalue()), 1):
+                out.append(PageImg(f"{f.name} (ص{k})", b))
+        else:
+            out.append(f)
+    return out
+
+
+def drive_fetch(url):
+    """يجلب ملفاً من رابط Google Drive/Docs/Sheets (إن كان مشاركاً لكل من لديه الرابط). يُرجع (اسم، بايتات) أو None."""
+    import re as _r, urllib.request
+    url = (url or "").strip()
+    m = _r.search(r"docs.google.com/(document|spreadsheets|presentation)/d/([\w-]+)", url)
+    if m:
+        kind, fid = m.groups()
+        ext = {"document": "docx", "spreadsheets": "xlsx", "presentation": "pptx"}[kind]
+        link = f"https://docs.google.com/{kind}/d/{fid}/export?format={ext}"
+        name = f"drive.{ext}"
+    else:
+        m = _r.search(r"drive.google.com/(?:file/d/|open\?id=|uc\?id=)([\w-]+)", url)
+        if not m:
+            return None
+        link = f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+        name = "drive_file"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(link, headers={"User-Agent": "Mozilla/5.0"}), timeout=20) as r:
+            data = r.read(15 * 1024 * 1024)
+            ctype = r.headers.get("Content-Type", "")
+            if "text/html" in ctype:
+                return None
+            if name == "drive_file":
+                name += ".pdf" if "pdf" in ctype else (".docx" if "word" in ctype else (".xlsx" if "sheet" in ctype or "excel" in ctype else (".png" if "png" in ctype else ".jpg" if "jpeg" in ctype else "")))
+            return name, data
+    except Exception:
+        log.exception("drive fetch")
+        return None
+
+
+def read_any(name, data):
+    """يقرأ نص أي ملف: صورة (OCR) أو Word/Excel/PowerPoint/PDF (وPDF الممسوح ضوئياً عبر OCR)."""
+    if is_image_name(name):
+        return (ocr_image(shrink(data)) or "").strip()
+    t = doc_to_text(name, data)
+    if not t and name.lower().endswith(".pdf"):
+        parts = [ocr_image(shrink(b)) or "" for b in pdf_pages_png(data, 6)]
+        t = "\n".join(x for x in parts if x).strip()
+    return t
 
 
 def ocr_image(b):
@@ -1461,7 +1548,7 @@ def workshop(kind, placeholder, system_fn, turn_cls, temperature):
     text = text.strip()
     _all = list(getattr(prompt, "files", None) or [])
     files = [shrink(f.getvalue()) for f in _all if is_image_name(f.name)]
-    doc_texts = [(f.name, doc_to_text(f.name, f.getvalue())) for f in _all if not is_image_name(f.name)]
+    doc_texts = [(f.name, read_any(f.name, f.getvalue())) for f in _all if not is_image_name(f.name)]
 
     chat_id = st.session_state[ik]
     owner = st.session_state.user["owner"]
@@ -1481,7 +1568,7 @@ def workshop(kind, placeholder, system_fn, turn_cls, temperature):
                 try:
                     for dn, dt in doc_texts:
                         if not dt:
-                            st.warning(f"تعذرت قراءة نص الملف «{dn}» (قد يكون ممسوحاً ضوئياً: صوّره كصور بدلاً من ذلك).")
+                            st.warning(f"تعذرت قراءة الملف «{dn}». جرّب صورة أوضح أو صيغة أخرى.")
                             continue
                         smsg = {"role": "source", "content": f"[ملف: {dn}]\n{dt}", "images": []}
                         st.session_state[mk].append(smsg)
@@ -1668,7 +1755,7 @@ def email_box(key):
 
 PRIVACY_TEXT = """
 - يُرسَل نص طلباتك وصور الوثائق التي ترفعها إلى خدمة ذكاء اصطناعي خارجية (OpenAI) لمعالجتها فقط.
-- نحفظ بريدك وملفك البيداغوجي ومحادثاتك لتجدها لاحقاً، ولا نبيعها ولا نشاركها مع أي طرف.
+- نحفظ بريدك وملفك البيداغوجي ومحادثاتك لنوفّر لك الخدمة وتجدها لاحقاً.
 - قائمة أسماء القسم تُحفظ في جلستك فقط ولا تُرسَل للذكاء الاصطناعي إلا إذا اخترت أن يقرأ الاسم من الورقة. اختر «حسب ترتيب الرفع» لإبقاء الأسماء عندك. لا تُدخل معطيات حساسة أخرى عن التلاميذ.
 - مخرجات الذكاء الاصطناعي قد تحتوي أخطاء: راجع كل جذاذة وامتحان وعلامة قبل اعتمادها.
 - يمكنك في أي وقت حذف كل بياناتك من القائمة الجانبية (زر «احذف بياناتي»).
@@ -1681,7 +1768,11 @@ st.set_page_config(page_title="المساعد التربوي الذكي", page_i
 
 st.markdown("""<style>
 [data-testid="stExpandSidebarButton"], [data-testid="collapsedControl"] {
-  width: auto !important; background: #ff4b4b; color: #fff !important; border-radius: 20px; padding: 4px 12px; }
+  width: auto !important; background: #0e8a6a; color: #fff !important; border-radius: 20px; padding: 4px 12px; }
+button[kind="primary"], [data-testid="stBaseButton-primary"] {
+  background-color: #0e8a6a !important; border-color: #0e8a6a !important; color: #fff !important; }
+button[kind="primary"]:hover, [data-testid="stBaseButton-primary"]:hover {
+  background-color: #0b7258 !important; border-color: #0b7258 !important; }
 [data-testid="stExpandSidebarButton"] svg, [data-testid="collapsedControl"] svg { fill: #fff !important; color: #fff !important; }
 [data-testid="stExpandSidebarButton"]::after, [data-testid="collapsedControl"]::after {
   content: " المادة والمستوى والسجل"; font-size: 14px; font-weight: 700; margin-inline-start: 6px; }
@@ -1695,18 +1786,14 @@ if "user" not in st.session_state:
     c2.info("📝 **امتحانات**\n\nأجزاء ونقاط حسب طلبك، وورقة مؤطرة جاهزة للطباعة")
     c3.info("🔍 **تصحيح**\n\nارفع صور الأوراق واحصل على العلامات وجدول Excel")
     st.divider()
-    st.markdown("**ادخل ببريدك الإلكتروني** (بدون كلمة سر) ليُحفظ ملفك وسجل محادثاتك:")
+    if st.button("🚀 ابدأ الآن مجاناً", type="primary", use_container_width=True):
+        st.session_state.user = {"email": None, "owner": "guest:" + str(uuid.uuid4()), "display": "الأستاذ(ة)"}
+        st.rerun()
+    st.caption("بالضغط على «ابدأ» أو بدخولك ببريدك فأنت توافق على سياسة الخصوصية، وتتحمّل مسؤولية استعمال أسماء التلاميذ وفق ضوابط مؤسستك.")
+    st.markdown("**تريد حفظ ملفك وسجلك؟** ادخل ببريدك (بدون كلمة سر):")
+    email_box("landing")
     with st.expander("🔒 سياسة الخصوصية والاستعمال"):
         st.markdown(PRIVACY_TEXT)
-    consent = st.checkbox("قرأت سياسة الخصوصية وأوافق عليها، وأتحمّل مسؤولية استعمال أسماء التلاميذ وفق الضوابط المعمول بها في مؤسستي.", key="consent_ok")
-    if consent:
-        if st.button("🚀 جرّب الآن بدون تسجيل", type="primary", use_container_width=True):
-            st.session_state.user = {"email": None, "owner": "guest:" + str(uuid.uuid4()), "display": "الأستاذ(ة)"}
-            st.rerun()
-        st.markdown("**أو ادخل ببريدك** ليُحفظ ملفك وسجلك:")
-        email_box("landing")
-    else:
-        st.caption("وافق على الشروط أعلاه لتتمكن من الدخول.")
     st.stop()
 
 user = st.session_state.user
@@ -1912,7 +1999,7 @@ with tab_grader:
     st.subheader("🔍 المصحح البيداغوجي الآلي (جماعي)")
     st.info("📸 اختر الامتحان، ثم أضف تلاميذك واحداً واحداً (أو ارفع دفعة كاملة). ستحصل على جدول نتائج قابل للتعديل وتقرير للقسم.")
 
-    # ---- قائمة القسم (اختيارية) ----
+    st.markdown("##### اتبع الخطوات الأربع: ① الامتحان ← ② البارم ← ③ القسم ← ④ أوراق التلاميذ")
     def parse_roster(text, file):
         names = []
         if file is not None:
@@ -1929,24 +2016,112 @@ with tab_grader:
                 seen.add(n); out.append(n)
         return out
 
-    with st.expander("👥 قائمة أسماء القسم (اختياري) — لجدول النقط المطبوع", expanded=False):
-        st.caption("ارفع ملف Excel/CSV فيه عمود الأسماء، أو الصق الأسماء (اسم في كل سطر).")
-        rc1, rc2 = st.columns(2)
-        roster_file = rc1.file_uploader("ملف القسم", type=["xlsx", "csv"], key="roster_file")
-        roster_text = rc2.text_area("أو الصق الأسماء", key="roster_text", height=120)
-        st.text_input("اسم القسم (مثال: 7 أساسي 2)", key="class_name")
-        st.radio("كيف تُربط العلامات بالأسماء؟",
-                 ["يقرأ المساعد الاسم من الورقة ويطابقه مع القائمة",
-                  "حسب ترتيب رفع الأوراق (لا يُرسَل أي اسم للذكاء الاصطناعي)"],
-                 key="roster_mode")
-        _r = parse_roster(roster_text, roster_file)
-        if _r:
-            st.session_state.roster = _r
-        if st.session_state.get("roster"):
-            st.success(f"عدد التلاميذ في القائمة: {len(st.session_state.roster)}")
+
+    # ===== ① الامتحان =====
+    st.markdown("#### ① الامتحان")
+    _opts = {"— لم أختر امتحاناً من التطبيق —": None}
+    if st.session_state.get("draft_exam"):
+        _opts["الامتحان المفتوح الآن"] = ("current", None)
+    try:
+        for c_id, c_title, c_time, c_type in get_all_chats(user["owner"])[:20]:
+            if c_type != "lesson":
+                _opts[f"{c_title} — {c_time}"] = ("saved", c_id)
+    except Exception:
+        pass
+    _labels = list(_opts)
+    _default = 1 if len(_labels) > 1 and _labels[1] == "الامتحان المفتوح الآن" else 0
+    _pick = st.selectbox("اختر امتحاناً أنشأته هنا (يأتي معه البارم تلقائياً)", _labels, index=_default, key="grade_exam_pick")
+    draft, _sel = None, _opts.get(_pick)
+    if _sel:
+        draft = st.session_state.get("draft_exam") if _sel[0] == "current" else load_draft(_sel[1])
+    use_key = bool(draft)
+    exam_files = []
+    exam_text = ""
+    if not draft:
+        exam_files = st.file_uploader("أو ارفع ورقة الامتحان (صور، Word، Excel، PDF...)", type=IMG_TYPES + DOC_TYPES,
+                                      accept_multiple_files=True, key="exam_files")
+        exam_link = st.text_input("أو ألصق رابط Google Drive (الملف مشارَك لكل من لديه الرابط)", key="exam_link")
+        _ek = (tuple((f.name, getattr(f, "size", 0)) for f in (exam_files or [])), (exam_link or "").strip())
+        _ec = st.session_state.get("_exam_cache")
+        if _ec and _ec[0] == _ek:
+            exam_text = _ec[1]
+        elif _ek[0] or _ek[1]:
+            parts = []
+            try:
+                for f in exam_files or []:
+                    parts.append(read_any(f.name, f.getvalue()))
+                if _ek[1]:
+                    got = drive_fetch(_ek[1])
+                    if got:
+                        parts.append(read_any(got[0], got[1]))
+                    else:
+                        st.warning("تعذّر فتح الرابط. تأكد أن مشاركته «لكل من لديه الرابط»، أو حمّل الملف وارفعه.")
+            except Exception:
+                log.exception("exam read")
+                st.warning("تعذرت قراءة ملف الامتحان.")
+            exam_text = "\n".join(x for x in parts if x).strip()
+            st.session_state["_exam_cache"] = (_ek, exam_text)
+        if exam_text:
+            st.caption("✓ تمت قراءة الامتحان.")
+
+    # ===== ② البارم =====
+    st.markdown("#### ② البارم (سلّم الإصلاح)")
+    barem = ""
+    no_key_ok = True
+    if draft:
+        st.success(f"✓ البارم جاهز تلقائياً من امتحانك (العلامة القصوى {exam_total(draft):g}). يمكنك تعديله من تبويب الامتحان.")
+    else:
+        barem_text = st.text_area("اكتب البارم هنا", key="barem_text", height=100,
+                                  placeholder="مثال: س1 (4 ن): التعريف ... / س2 (6 ن): ...")
+        barem_file = st.file_uploader("أو ارفعه (صورة، Word، Excel، PDF...)", type=IMG_TYPES + DOC_TYPES, key="barem_file")
+        barem_link = st.text_input("أو ألصق رابط Google Drive", key="barem_link")
+        _bf_text = ""
+        _bk = ((barem_file.name, getattr(barem_file, "size", 0)) if barem_file else None, (barem_link or "").strip())
+        _cache = st.session_state.get("_barem_cache")
+        if _cache and _cache[0] == _bk:
+            _bf_text = _cache[1]
+        elif _bk[0] or _bk[1]:
+            try:
+                if barem_file:
+                    _bf_text = read_any(barem_file.name, barem_file.getvalue())
+                if _bk[1]:
+                    got = drive_fetch(_bk[1])
+                    if got:
+                        _bf_text = (_bf_text + "\n" + read_any(got[0], got[1])).strip()
+                    else:
+                        st.warning("تعذّر فتح الرابط. تأكد أن مشاركته «لكل من لديه الرابط».")
+            except Exception:
+                log.exception("barem read")
+                st.warning("تعذرت قراءة البارم. ألصق نصه في الخانة أعلاه.")
+            st.session_state["_barem_cache"] = (_bk, _bf_text)
+        barem = (str(barem_text or "").strip() + "\n" + _bf_text).strip()
+        if barem:
+            st.caption("✓ البارم جاهز.")
+        else:
+            no_key_ok = st.checkbox("أصحّح دون بارم (دقة أقل: يقدّر المساعد الإجابات بنفسه)", key="no_key_ok")
+
+    # ===== ③ القسم =====
+    st.markdown("#### ③ القسم")
+    _c_main = st.container()
+    _c_roster = st.container()
+    _adv = st.container()
+    with _c_roster:
+        with st.expander("👥 قائمة أسماء القسم (اختياري)", expanded=False):
+            st.caption("ارفع ملف Excel/CSV فيه عمود الأسماء، أو الصق الأسماء (اسم في كل سطر).")
+            rc1, rc2 = st.columns(2)
+            roster_file = rc1.file_uploader("ملف القسم", type=["xlsx", "csv"], key="roster_file")
+            roster_text = rc2.text_area("أو الصق الأسماء", key="roster_text", height=120)
+            st.radio("كيف تُربط العلامات بالأسماء؟",
+                     ["يقرأ المساعد الاسم من الورقة ويطابقه مع القائمة",
+                      "حسب ترتيب رفع الأوراق (لا يُرسَل أي اسم للذكاء الاصطناعي)"],
+                     key="roster_mode")
+            _r = parse_roster(roster_text, roster_file)
+            if _r:
+                st.session_state.roster = _r
+            if st.session_state.get("roster"):
+                st.success(f"عدد التلاميذ في القائمة: {len(st.session_state.roster)}")
     _roster = st.session_state.get("roster") or []
     _by_order = bool(_roster) and str(st.session_state.get("roster_mode", "")).startswith("حسب")
-
     def apply_roster(d, idx, by_order=None):
         if by_order is None:
             by_order = _by_order
@@ -1961,122 +2136,85 @@ with tab_grader:
             if hit:
                 d["student_name"] = hit[0]
         return d
-    # ---- 0) عدد تلاميذ القسم ----
+
     if _roster and not st.session_state.get("class_size"):
         st.session_state["class_size"] = len(_roster)
-    cs1, cs2 = st.columns(2)
-    class_size = int(cs1.number_input("👥 عدد تلاميذ القسم (0 = غير محدد)", min_value=0, max_value=60, step=1, key="class_size"))
-    absent = int(cs2.number_input("عدد الغائبين", min_value=0, max_value=max(class_size, 1), step=1, key="absent_n")) if class_size else 0
+    with _c_main:
+        st.text_input("اسم القسم (مثال: 7 أساسي 2)", key="class_name")
+        cs1, cs2 = st.columns(2)
+        class_size = int(cs1.number_input("عدد تلاميذ القسم (0 = غير محدد)", min_value=0, max_value=60, step=1, key="class_size"))
+        absent = int(cs2.number_input("عدد الغائبين", min_value=0, max_value=max(class_size, 1), step=1, key="absent_n")) if class_size else 0
     _prev = st.session_state.get("grades") or []
     _done = len(_prev) + absent
     _left = max(class_size - _done, 0) if class_size else None
     if class_size:
         st.progress(min(_done / class_size, 1.0), text=f"صُحّح {len(_prev)} من {class_size}" + (f" (+{absent} غائب)" if absent else ""))
         if _left == 0:
-            st.success("اكتمل القسم ✅ لا يمكن إضافة تلاميذ آخرين. استعمل «قسم جديد» أسفل النتائج لبدء قسم آخر.")
+            st.success("اكتمل القسم ✅ استعمل «قسم جديد» أسفل النتائج لبدء قسم آخر.")
 
-    # ---- 1) اختيار الامتحان (سلّم الإصلاح) ----
-    _opts = {"بدون سلّم إصلاح (أصحّح بشروطي أسفله)": None}
-    if st.session_state.get("draft_exam"):
-        _opts["الامتحان المفتوح الآن"] = ("current", None)
-    try:
-        for c_id, c_title, c_time, c_type in get_all_chats(user["owner"])[:20]:
-            if c_type != "lesson":
-                _opts[f"{c_title} — {c_time}"] = ("saved", c_id)
-    except Exception:
-        pass
-    _labels = list(_opts)
-    _default = 1 if len(_labels) > 1 and _labels[1] == "الامتحان المفتوح الآن" else 0
-    _pick = st.selectbox("📝 الامتحان الذي سأصحّح على أساسه", _labels, index=_default, key="grade_exam_pick")
-    draft, _sel = None, _opts.get(_pick)
-    if _sel:
-        draft = st.session_state.get("draft_exam") if _sel[0] == "current" else load_draft(_sel[1])
-    use_key = bool(draft)
-    if draft:
-        st.caption(f"سيُصحَّح على سلّم إصلاح هذا الامتحان (العلامة القصوى {exam_total(draft):g}).")
-    barem_text = st.text_area("📋 أو ألصق البارم / الإصلاح الذي تريد التصحيح عليه (اختياري)", key="barem_text", height=100,
-                              placeholder="مثال: س1 (4 ن): التعريف ... / س2 (6 ن): ...")
-    barem_file = st.file_uploader("أو ارفع البارم (Word، Excel، PDF، صورة)", type=IMG_TYPES + DOC_TYPES, key="barem_file")
-    _bf_text = ""
-    if barem_file:
-        _bk = (barem_file.name, getattr(barem_file, "size", 0))
-        _cache = st.session_state.get("_barem_cache")
-        if _cache and _cache[0] == _bk:
-            _bf_text = _cache[1]
-        else:
-            try:
-                if is_image_name(barem_file.name):
-                    _bf_text = ocr_image(shrink(barem_file.getvalue())) or ""
-                else:
-                    _bf_text = doc_to_text(barem_file.name, barem_file.getvalue())
-            except Exception:
-                log.exception("barem read")
-                st.warning("تعذرت قراءة ملف البارم. ألصق نصه في الخانة أعلاه.")
-            st.session_state["_barem_cache"] = (_bk, _bf_text)
-    barem = (str(barem_text or "").strip() + "\n" + _bf_text).strip()
-    no_key_ok = True
-    if not draft and not barem:
-        no_key_ok = st.checkbox("أصحّح دون بارم (دقة أقل: يقدّر المساعد الإجابات بنفسه)", key="no_key_ok")
-
-    # ---- 2) أوراق التلاميذ ----
-    with st.expander("⚙️ خيارات متقدمة: رفع دفعة واحدة"):
-        grade_mode = st.radio("طريقة إضافة الأوراق", ["تلميذ بتلميذ (الأسهل)", "دفعة واحدة (صور مرتبة)"],
-                              horizontal=True, key="grade_mode")
+    # ===== ④ أوراق التلاميذ =====
+    st.markdown("#### ④ أوراق التلاميذ")
+    _students = st.container()
+    with _adv:
+        with st.expander("⚙️ خيارات متقدمة (للمستخدم المتمرّس)"):
+            grade_mode = st.radio("طريقة إضافة الأوراق", ["تلميذ بتلميذ (الأسهل)", "دفعة واحدة (صور مرتبة)"],
+                                  horizontal=True, key="grade_mode")
+            grading_instructions = st.text_area("شروط التصحيح وسلّم التنقيط", "صحّح الورقة بدقة وموضوعية دون تساهل، وأعطِ علامة مع ملاحظة بيداغوجية.", key="grading_text")
     batch = not str(grade_mode).startswith("تلميذ")
     groups_in = []
-    if not batch:
-        if "n_students" not in st.session_state:
-            st.session_state.n_students = 1
+    with _students:
+        if not batch:
+            if "n_students" not in st.session_state:
+                st.session_state.n_students = 1
 
-        def _add_student():
-            st.session_state.n_students += 1
+            def _add_student():
+                st.session_state.n_students += 1
 
-        def _del_student():
-            st.session_state.n_students = max(1, st.session_state.n_students - 1)
+            def _del_student():
+                st.session_state.n_students = max(1, st.session_state.n_students - 1)
 
-        _slots = int(st.session_state.n_students)
-        if class_size:
-            _slots = min(_slots, _left)
-        for k in range(_slots):
-            with st.container(border=True):
-                ca, cb = st.columns([1, 2])
-                if _roster:
-                    pick = ca.selectbox(f"التلميذ {k + 1}", ["(يُقرأ الاسم من الورقة)"] + _roster, key=f"stu_name_{k}")
-                    nm = "" if str(pick).startswith("(") else pick
-                else:
-                    nm = str(ca.text_input(f"اسم التلميذ {k + 1} (اختياري)", key=f"stu_name_{k}")).strip()
-                fs = cb.file_uploader("صفحات ورقته (يمكن رفع عدة صور)", type=IMG_TYPES, accept_multiple_files=True,
-                                      key=f"stu_files_{k}")
-                if fs:
-                    groups_in.append((list(fs), nm))
-        bc1, bc2, _sp = st.columns([1, 1, 3])
-        bc1.button("➕ تلميذ آخر", on_click=_add_student, key="add_stu",
-                   disabled=bool(class_size) and int(st.session_state.n_students) >= _left)
-        bc2.button("➖ حذف الأخير", on_click=_del_student, key="del_stu")
-    else:
-        student_imgs = st.file_uploader("أوراق التلاميذ", type=IMG_TYPES, accept_multiple_files=True, key="student_files")
-        pages_per = st.number_input("عدد صفحات (صور) ورقة كل تلميذ", min_value=1, max_value=10, value=1, step=1, key="pages_per",
-                                    help="1 = كل صورة تلميذ مختلف. ضع 5 مثلاً إن كان لكل تلميذ 5 صفحات: سترفعها مرتبة.")
-        if student_imgs:
-            _n = int(pages_per)
-            groups_in = [(list(student_imgs[j:j + _n]), "") for j in range(0, len(student_imgs), _n)]
-            if _n > 1:
-                st.caption(f"سيُصحَّح {len(groups_in)} تلميذ(ة) من {len(student_imgs)} صورة. رتّب الصور بحيث تتتالى صفحات كل تلميذ.")
+            _slots = int(st.session_state.n_students)
+            if class_size:
+                _slots = min(_slots, _left)
+            for k in range(_slots):
+                with st.container(border=True):
+                    ca, cb = st.columns([1, 2])
+                    if _roster:
+                        pick = ca.selectbox(f"التلميذ {k + 1}", ["(يُقرأ الاسم من الورقة)"] + _roster, key=f"stu_name_{k}")
+                        nm = "" if str(pick).startswith("(") else pick
+                    else:
+                        nm = str(ca.text_input(f"اسم التلميذ {k + 1} (اختياري)", key=f"stu_name_{k}")).strip()
+                    fs = cb.file_uploader("صور ورقته (كل الصفحات) أو ملف PDF", type=IMG_TYPES + ["pdf"], accept_multiple_files=True,
+                                          key=f"stu_files_{k}")
+                    if fs:
+                        groups_in.append((expand_pages(list(fs)), nm))
+            bc1, bc2, _sp = st.columns([1, 1, 3])
+            bc1.button("➕ تلميذ آخر", on_click=_add_student, key="add_stu",
+                       disabled=bool(class_size) and int(st.session_state.n_students) >= _left)
+            bc2.button("➖ حذف الأخير", on_click=_del_student, key="del_stu")
+        else:
+            student_imgs = st.file_uploader("أوراق التلاميذ", type=IMG_TYPES + ["pdf"], accept_multiple_files=True, key="student_files")
+            pages_per = st.number_input("عدد صفحات (صور) ورقة كل تلميذ", min_value=1, max_value=10, value=1, step=1, key="pages_per",
+                                        help="1 = كل صورة تلميذ مختلف. ضع 5 مثلاً إن كان لكل تلميذ 5 صفحات: سترفعها مرتبة.")
+            if student_imgs:
+                _imgs = expand_pages(list(student_imgs))
+                _n = int(pages_per)
+                groups_in = [(list(_imgs[j:j + _n]), "") for j in range(0, len(_imgs), _n)]
+                if _n > 1:
+                    st.caption(f"سيُصحَّح {len(groups_in)} تلميذ(ة) من {len(_imgs)} صورة. رتّب الصور بحيث تتتالى صفحات كل تلميذ.")
 
-    if class_size and len(groups_in) > _left:
-        st.warning(f"المتبقي في القسم {_left} تلميذ(ة) فقط؛ سيُعالج أول {_left} فقط.")
-        groups_in = groups_in[:_left]
-    _total_imgs = sum(len(g) for g, _ in groups_in)
-    if _total_imgs > 40:
-        st.warning("الحد الأقصى 40 صورة في كل مرة؛ سيُعالج أول 40 فقط.")
-        _kept, _c = [], 0
-        for g, nm_ in groups_in:
-            if _c + len(g) > 40:
-                break
-            _kept.append((g, nm_)); _c += len(g)
-        groups_in, _total_imgs = _kept, _c
-
-    grading_instructions = st.text_area("شروط التصحيح وسلّم التنقيط", "صحّح الورقة بدقة وموضوعية دون تساهل، وأعطِ علامة مع ملاحظة بيداغوجية.", key="grading_text")
+        if class_size and len(groups_in) > _left:
+            st.warning(f"المتبقي في القسم {_left} تلميذ(ة) فقط؛ سيُعالج أول {_left} فقط.")
+            groups_in = groups_in[:_left]
+        _total_imgs = sum(len(g) for g, _ in groups_in)
+        if _total_imgs > 40:
+            st.warning("الحد الأقصى 40 صورة في كل مرة؛ سيُعالج أول 40 فقط.")
+            _kept, _c = [], 0
+            for g, nm_ in groups_in:
+                if _c + len(g) > 40:
+                    break
+                _kept.append((g, nm_)); _c += len(g)
+            groups_in, _total_imgs = _kept, _c
 
     if st.button("🚀 تصحيح الأوراق", type="primary", key="grade_go"):
         if not groups_in:
@@ -2092,6 +2230,8 @@ with tab_grader:
                 max_note = f" العلامة القصوى {exam_total(draft):g}."
             if barem:
                 instr += f"\n\nالبارم / الإصلاح الذي قدّمه الأستاذ (التزم به حرفياً في توزيع العلامات):\n{barem}"
+            if exam_text:
+                instr += f"\n\nنص الامتحان:\n{exam_text}"
             results, bar = [], st.progress(0.0, text="بدء التصحيح...")
             for i, (grp, nm) in enumerate(groups_in, 1):
                 f = grp[0]

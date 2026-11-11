@@ -10,3 +10,6 @@ arabic-reshaper
 python-bidi
 pypdf
 psycopg2-binary
+pymupdf
+python-pptx
+xlrd
