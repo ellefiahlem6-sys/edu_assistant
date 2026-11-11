@@ -56,6 +56,16 @@ class LessonModel(BaseModel):
     lesson_blocks: list[Block]
 
 
+class Slide(BaseModel):
+    heading: str
+    bullets: list[str]
+
+
+class SlideDeck(BaseModel):
+    title: str
+    slides: list[Slide]
+
+
 class LessonTurn(BaseModel):
     reply: str
     draft: Optional[LessonModel]
@@ -1587,6 +1597,74 @@ def color_picker_ui(kind):
         st.selectbox("اللون", list(ACCENT_COLORS), key=f"{kind}_color_name")
 
 
+
+def make_deck(d, lang):
+    """يحوّل الجذاذة إلى شرائح عرض قصيرة للتلاميذ."""
+    system = f"""أنت أستاذ يحوّل جذاذة درس إلى شرائح عرض للتلاميذ على شاشة القسم. اللغة: {lang}.
+القواعد: من 6 إلى 14 شريحة. لكل شريحة عنوان قصير و2 إلى 5 نقاط، وكل نقطة أقل من 12 كلمة.
+لا تنقل نص الجذاذة حرفياً بل لخّصه بعبارات واضحة للتلاميذ. لا تضف معلومات غير موجودة في الجذاذة.
+ابدأ بشريحة أهداف الدرس إن وُجدت في الجذاذة، وأنهِ بخلاصة أو تقويم إن وُجد فيها."""
+    return parse_structured([{"role": "system", "content": system},
+                             {"role": "user", "content": json.dumps(d, ensure_ascii=False)}],
+                            SlideDeck, 0.3, kind="text", effort="low")
+
+
+def build_slides_html(deck, lang, meta, accent=None):
+    """صفحة HTML واحدة مستقلة لعرض الشرائح (تعمل بلا إنترنت)."""
+    import html as _h
+    rtl = lang == "العربية"
+    col = "#" + ACCENT_COLORS[accent][0] if accent in ACCENT_COLORS else "#0e8a6a"
+    e = lambda x: _h.escape(str(x or ""))
+    sub = " — ".join(x for x in (meta.get("subject"), meta.get("grade")) if x)
+    who = " | ".join(x for x in (meta.get("teacher"), meta.get("school")) if x)
+    parts = [f"<section class='s t'><h1>{e(deck['title'])}</h1><p>{e(sub)}</p><p class='m'>{e(who)}</p></section>"]
+    for sl in deck["slides"]:
+        li = "".join(f"<li>{e(b)}</li>" for b in sl["bullets"])
+        parts.append(f"<section class='s'><h2>{e(sl['heading'])}</h2><ul>{li}</ul></section>")
+    body = "\n".join(parts)
+    return f"""<!doctype html><html lang="{'ar' if rtl else 'fr'}" dir="{'rtl' if rtl else 'ltr'}"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>{e(deck['title'])}</title>
+<style>
+:root{{--bg:#fff;--fg:#14202b;--ac:{col};--mu:#5b6b7a}}
+body.dark{{--bg:#0f1720;--fg:#f2f6fa;--mu:#9fb0c0}}
+*{{box-sizing:border-box}}html,body{{margin:0;height:100%;background:var(--bg);color:var(--fg);
+font-family:'Segoe UI','Noto Naskh Arabic','Noto Sans Arabic',Tahoma,Arial,sans-serif}}
+.s{{display:none;height:100%;padding:6vh 7vw 14vh;flex-direction:column;justify-content:center;gap:3vh}}
+.s.on{{display:flex}}
+.s h1{{font-size:clamp(34px,7vw,92px);margin:0;color:var(--ac);line-height:1.25}}
+.s h2{{font-size:clamp(28px,5vw,66px);margin:0 0 2vh;color:var(--ac);border-bottom:4px solid var(--ac);padding-bottom:1.5vh;line-height:1.3}}
+.s p{{font-size:clamp(20px,3.2vw,42px);margin:0}}.s p.m{{color:var(--mu);font-size:clamp(16px,2.4vw,30px)}}
+.s ul{{margin:0;padding-inline-start:1.2em;font-size:clamp(22px,3.8vw,52px);line-height:1.55}}
+.s li{{margin-bottom:1.6vh}}.s.t{{align-items:center;text-align:center}}
+#bar{{position:fixed;top:0;inset-inline-start:0;height:6px;background:var(--ac);width:0;transition:width .25s}}
+#nav{{position:fixed;bottom:2vh;left:0;right:0;display:flex;justify-content:center;align-items:center;gap:12px;direction:ltr}}
+#nav button{{background:var(--ac);color:#fff;border:0;border-radius:999px;font-size:clamp(18px,2.6vw,30px);padding:.5em 1.1em;cursor:pointer}}
+#nav button.g{{background:transparent;color:var(--mu);border:2px solid var(--mu)}}
+#c{{color:var(--mu);font-size:clamp(14px,2vw,22px);min-width:4.5em;text-align:center}}
+</style></head><body><div id="bar"></div>
+{body}
+<div id="nav"><button id="p" aria-label="prev">&#9664;</button><span id="c"></span><button id="n" aria-label="next">&#9654;</button>
+<button class="g" id="th" title="theme">&#9680;</button><button class="g" id="fs" title="fullscreen">&#9974;</button></div>
+<script>
+var S=[].slice.call(document.querySelectorAll('.s')),i=0,R={'true' if rtl else 'false'};
+function show(k){{i=Math.max(0,Math.min(S.length-1,k));S.forEach(function(x,j){{x.classList.toggle('on',j===i)}});
+document.getElementById('c').textContent=(i+1)+' / '+S.length;document.getElementById('bar').style.width=((i+1)/S.length*100)+'%'}}
+function nx(){{show(i+1)}}function pv(){{show(i-1)}}
+document.getElementById('n').onclick=R?pv:nx;document.getElementById('p').onclick=R?nx:pv;
+document.getElementById('th').onclick=function(){{document.body.classList.toggle('dark')}};
+function fs(){{var e=document.documentElement;try{{document.fullscreenElement?document.exitFullscreen():e.requestFullscreen()}}catch(x){{}}}}
+document.getElementById('fs').onclick=fs;
+document.addEventListener('keydown',function(ev){{var k=ev.key;
+if(k==='ArrowRight')R?pv():nx();else if(k==='ArrowLeft')R?nx():pv();
+else if(k===' '||k==='Enter'||k==='PageDown')nx();else if(k==='PageUp'||k==='Backspace')pv();
+else if(k==='Home')show(0);else if(k==='End')show(S.length-1);else if(k==='f'||k==='F')fs();else if(k==='t'||k==='T')document.body.classList.toggle('dark')}});
+var sx=null;document.addEventListener('touchstart',function(e){{sx=e.touches[0].clientX}});
+document.addEventListener('touchend',function(e){{if(sx===null)return;var d=e.changedTouches[0].clientX-sx;
+if(Math.abs(d)>50){{(d<0)===R?pv():nx()}}sx=null}});
+show(0);
+</script></body></html>"""
+
+
 def preview_lesson(lang, attach):
     d = st.session_state.get("draft_lesson")
     if not d:
@@ -1602,6 +1680,29 @@ def preview_lesson(lang, attach):
     data = create_lesson_doc(d, lang, doc_meta(), chat_images("lesson") if attach else None).getvalue()
     st.download_button("⬇️ تحميل الجذاذة (Word)", data, f"Jadhatha_{safe_name(prof('subject'))}_{safe_name(grade_label())}.docx",
                        DOCX_MIME, type="primary", use_container_width=True)
+
+    # ---- عرض الدرس على الشاشة ----
+    import hashlib
+    _h = hashlib.md5(json.dumps(d, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+    if st.button("🖥️ اعرض الدرس على الشاشة", key="show_slides", use_container_width=True):
+        if require_credit(1):
+            with st.spinner("أجهّز شرائح العرض..."):
+                try:
+                    st.session_state["lesson_deck"] = (_h, make_deck(d, lang).model_dump())
+                except Exception as e:
+                    log.exception("make_deck")
+                    st.error(friendly_error(e))
+    _sd = st.session_state.get("lesson_deck")
+    if _sd and _sd[0] == _h:
+        _html = build_slides_html(_sd[1], lang, doc_meta(), accent_for("lesson"))
+        try:
+            import streamlit.components.v1 as components
+            components.html(_html, height=560, scrolling=False)
+        except Exception:
+            pass
+        st.caption("الأسهم أو اللمس للتنقل، وزر ⛶ للملء الشاشة. أو حمّل الملف أدناه وافتحه في أي متصفح بلا إنترنت.")
+        st.download_button("⬇️ تحميل العرض (يعمل بلا إنترنت)", _html.encode("utf-8"),
+                           f"Ardh_{safe_name(prof('subject'))}_{safe_name(d['title'])}.html", "text/html", use_container_width=True)
 
 
 def preview_exam(lang, meta, target, attach):
@@ -1741,6 +1842,7 @@ st.markdown("""<style>
   width: auto !important; background: #0e8a6a; color: #fff !important; border-radius: 20px; padding: 4px 12px; }
 button[kind="primary"], [data-testid="stBaseButton-primary"] {
   background-color: #0e8a6a !important; border-color: #0e8a6a !important; color: #fff !important; }
+[data-testid="stFileUploaderDropzoneInstructions"] { display: none; }
 button[kind="primary"]:hover, [data-testid="stBaseButton-primary"]:hover {
   background-color: #0b7258 !important; border-color: #0b7258 !important; }
 [data-testid="stExpandSidebarButton"] svg, [data-testid="collapsedControl"] svg { fill: #fff !important; color: #fff !important; }
@@ -2094,6 +2196,7 @@ with tab_grader:
     batch = not str(grade_mode).startswith("تلميذ")
     groups_in = []
     with _students:
+        st.caption("📱 من الهاتف: اضغط «Upload» ثم «Camera» لتصوير الورقة، أو «Files» لاختيار ملف (من Recent أو Downloads).")
         if not batch:
             if "n_students" not in st.session_state:
                 st.session_state.n_students = 1
