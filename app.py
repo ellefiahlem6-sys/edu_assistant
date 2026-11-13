@@ -868,6 +868,7 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS accounts (email TEXT PRIMARY KEY, display_name TEXT, used INTEGER DEFAULT 0, created TEXT, profile TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS drafts (chat_id TEXT PRIMARY KEY, kind TEXT, data TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS grade_sets (owner TEXT PRIMARY KEY, data TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS events (ts TEXT, owner TEXT, kind TEXT, model TEXT, ok INTEGER, ms INTEGER, tokens INTEGER, err TEXT)""")
     if not using_pg():
         try:
             c.execute("ALTER TABLE accounts ADD COLUMN profile TEXT")
@@ -1026,6 +1027,28 @@ def delete_account_data(email):
     conn.close()
 
 
+def log_event(kind, model, ok, ms, tokens=0, err=""):
+    """يسجّل نداءً واحداً (بلا أي محتوى: لا دروس ولا أسماء تلاميذ)، ولا يعطّل التطبيق أبداً إن فشل."""
+    try:
+        import hashlib
+        _u = st.session_state.get("user") or {}
+        owner = hashlib.md5((_u.get("email") or "guest").encode()).hexdigest()[:8]
+        conn = db()
+        conn.execute("INSERT INTO events VALUES (?,?,?,?,?,?,?,?)",
+                     (datetime.now().isoformat(timespec="seconds"), owner, kind, model, int(ok), int(ms), int(tokens or 0), str(err)[:200]))
+        conn.commit()
+        conn.close()
+    except Exception:
+        log.exception("log_event")
+
+
+def events_summary():
+    conn = db()
+    rows = conn.execute("SELECT owner, kind, ok, tokens, ts, err FROM events").fetchall()
+    conn.close()
+    return rows
+
+
 def admin_stats():
     conn = db()
     accs = conn.execute("SELECT email, used, created FROM accounts ORDER BY created DESC").fetchall()
@@ -1115,11 +1138,17 @@ def llm(kind, messages, temperature=None, effort="medium", max_out=None, respons
         models.append(FALLBACK_MODEL)
     for m in models:
         kw = _params(m, temperature, effort, max_out)
+        import time as _t
+        _t0 = _t.time()
         try:
             if response_format is not None:
-                return client.beta.chat.completions.parse(model=m, messages=messages, response_format=response_format, **kw)
-            return client.chat.completions.create(model=m, messages=messages, **kw)
+                _r = client.beta.chat.completions.parse(model=m, messages=messages, response_format=response_format, **kw)
+            else:
+                _r = client.chat.completions.create(model=m, messages=messages, **kw)
+            log_event(kind, m, True, (_t.time() - _t0) * 1000, getattr(getattr(_r, "usage", None), "total_tokens", 0))
+            return _r
         except Exception as e:
+            log_event(kind, m, False, (_t.time() - _t0) * 1000, 0, e)
             if m != models[-1] and _model_unavailable(e):
                 log.warning("النموذج %s غير متاح (%s). نجرّب %s", m, e, models[-1])
                 continue
@@ -1694,6 +1723,48 @@ def preview_lesson(lang, attach):
                     st.error(friendly_error(e))
     _sd = st.session_state.get("lesson_deck")
     if _sd and _sd[0] == _h:
+        _deck = _sd[1]
+        _v = int(st.session_state.get("deck_ver", 0))
+
+        def _deck_op(op, i=None):
+            sl = _deck["slides"]
+            if op == "del" and len(sl) > 1:
+                sl.pop(i)
+            elif op == "up" and i > 0:
+                sl[i - 1], sl[i] = sl[i], sl[i - 1]
+            elif op == "down" and i < len(sl) - 1:
+                sl[i + 1], sl[i] = sl[i], sl[i + 1]
+            elif op == "add":
+                sl.append({"heading": "شريحة جديدة", "bullets": [""]})
+            st.session_state["deck_ver"] = _v + 1
+
+        with st.expander("✏️ عدّل الشرائح قبل العرض"):
+            _deck["title"] = st.text_input("عنوان العرض", _deck["title"], key=f"dk_t_{_v}")
+            for i, sl in enumerate(_deck["slides"]):
+                with st.container(border=True):
+                    sl["heading"] = st.text_input(f"عنوان الشريحة {i + 1}", sl["heading"], key=f"dk_h_{_v}_{i}")
+                    _txt = st.text_area("النقاط (نقطة في كل سطر)", "\n".join(sl["bullets"]), key=f"dk_b_{_v}_{i}", height=110)
+                    sl["bullets"] = [x.strip() for x in _txt.split("\n") if x.strip()]
+                    b1, b2, b3, _x = st.columns([1, 1, 1, 3])
+                    b1.button("⬆️", key=f"dk_up_{_v}_{i}", on_click=_deck_op, args=("up", i))
+                    b2.button("⬇️", key=f"dk_dn_{_v}_{i}", on_click=_deck_op, args=("down", i))
+                    b3.button("🗑️", key=f"dk_del_{_v}_{i}", on_click=_deck_op, args=("del", i))
+            st.button("➕ أضف شريحة", key=f"dk_add_{_v}", on_click=_deck_op, args=("add",))
+            _ask = st.text_input("أو اطلب تعديلاً بالكلام", placeholder="مثال: اختصر الشرائح، أضف مثالاً، بسّط اللغة", key=f"dk_ask_{_v}")
+            if st.button("طبّق التعديل", key=f"dk_apply_{_v}") and _ask.strip():
+                if require_credit(1):
+                    with st.spinner("أعدّل الشرائح..."):
+                        try:
+                            _nd = parse_structured(
+                                [{"role": "system", "content": f"عدّل شرائح العرض حسب طلب الأستاذ فقط، وأبقِ البنية نفسها. اللغة: {lang}."},
+                                 {"role": "user", "content": json.dumps(_deck, ensure_ascii=False) + "\n\nالطلب: " + _ask}],
+                                SlideDeck, 0.3, kind="text", effort="low")
+                            st.session_state["lesson_deck"] = (_h, _nd.model_dump())
+                            st.session_state["deck_ver"] = _v + 1
+                            st.rerun()
+                        except Exception as e:
+                            log.exception("deck edit")
+                            st.error(friendly_error(e))
         _html = build_slides_html(_sd[1], lang, doc_meta(), accent_for("lesson"))
         try:
             import streamlit.components.v1 as components
@@ -1934,6 +2005,15 @@ with st.sidebar:
                 accs, n_chats = admin_stats()
                 st.write(f"عدد الأساتذة: {len(accs)} — عدد المحادثات: {n_chats}")
                 st.dataframe(pd.DataFrame(accs, columns=["البريد", "الاستعمال", "التسجيل"]), use_container_width=True)
+                _ev = events_summary()
+                if _ev:
+                    _df = pd.DataFrame(_ev, columns=["أستاذ", "النوع", "نجاح", "رموز", "الوقت", "الخطأ"])
+                    st.write(f"نداءات الذكاء: {len(_df)} — الفاشلة: {int((_df['نجاح'] == 0).sum())} — الرموز: {int(_df['رموز'].sum()):,}")
+                    st.dataframe(_df.groupby("أستاذ").agg(نداءات=("النوع", "count"), رموز=("رموز", "sum")).reset_index(), use_container_width=True)
+                    _bad = _df[_df["نجاح"] == 0].tail(10)
+                    if len(_bad):
+                        st.caption("آخر الأخطاء")
+                        st.dataframe(_bad[["الوقت", "النوع", "الخطأ"]], use_container_width=True)
 
 # =====================================================================
 # التبويبات
@@ -2196,7 +2276,7 @@ with tab_grader:
     batch = not str(grade_mode).startswith("تلميذ")
     groups_in = []
     with _students:
-        st.caption("📱 من الهاتف: اضغط «Upload» ثم «Camera» لتصوير الورقة، أو «Files» لاختيار ملف (من Recent أو Downloads).")
+        st.caption("📱 من الهاتف: فعّل «صوّر بالكاميرا» داخل بطاقة التلميذ لتصوير الورقة دون مغادرة الصفحة، أو ارفع صورًا من المعرض.")
         if not batch:
             if "n_students" not in st.session_state:
                 st.session_state.n_students = 1
@@ -2220,8 +2300,23 @@ with tab_grader:
                         nm = str(ca_.text_input(f"اسم التلميذ {k + 1} (اختياري)", key=f"stu_name_{k}")).strip()
                     fs = cb_.file_uploader("صور ورقته (كل الصفحات) أو ملف PDF", type=IMG_TYPES + ["pdf"], accept_multiple_files=True,
                                            key=f"stu_files_{k}")
-                    if fs:
-                        groups_in.append((expand_pages(list(fs)), nm))
+                    _pg = expand_pages(list(fs)) if fs else []
+                    _cp = st.session_state.get(f"cam_pages_{k}", [])
+                    if cb_.checkbox("📷 صوّر بالكاميرا (دون مغادرة الصفحة)", key=f"cam_on_{k}"):
+                        _n = int(st.session_state.get(f"cam_n_{k}", 0))
+                        _shot = cb_.camera_input("صوّر الصفحة", key=f"cam_{k}_{_n}", label_visibility="collapsed")
+                        if _shot is not None and cb_.button("➕ أضف هذه الصفحة", key=f"cam_add_{k}_{_n}"):
+                            st.session_state.setdefault(f"cam_pages_{k}", []).append(_shot.getvalue())
+                            st.session_state[f"cam_n_{k}"] = _n + 1
+                            st.rerun()
+                    if _cp:
+                        cb_.caption(f"📷 {len(_cp)} صفحة مصوَّرة")
+                        if cb_.button("حذف الصور المصوَّرة", key=f"cam_clr_{k}"):
+                            st.session_state[f"cam_pages_{k}"] = []
+                            st.rerun()
+                        _pg = _pg + [PageImg(f"camera_{k}_{i}.jpg", b) for i, b in enumerate(_cp, 1)]
+                    if _pg:
+                        groups_in.append((_pg, nm))
             bc1, bc2, _sp = st.columns([1, 1, 3])
             bc1.button("➕ تلميذ آخر", on_click=_add_student, key="add_stu",
                        disabled=bool(class_size) and int(st.session_state.n_students) >= _left)
@@ -2395,80 +2490,14 @@ with tab_grader:
         else:
             st.caption("يظهر الجدول للتحميل بعد اكتمال تصحيح القسم.")
 
-        with st.expander("📂 تفاصيل وتقارير إضافية"):
-            xbio = io.BytesIO()
-            with pd.ExcelWriter(xbio, engine="openpyxl") as w:
-                df.to_excel(w, index=False, sheet_name="النتائج")
-                pd.DataFrame([{"التلميذ": r["student_name"], "نوع الخطأ": mk["category"], "الخطأ": mk["description"], "التصويب": mk["correction"]}
-                              for r in results for mk in r["mistakes"]]).to_excel(w, index=False, sheet_name="الأخطاء")
-            st.download_button("⬇️ تحميل جدول النتائج (Excel)", xbio.getvalue(), f"Resultats_{safe_name(prof('subject'))}.xlsx", XLSX_MIME)
-
-
-            by_name = {r["student_name"]: r for r in results}
-            order = list(_roster) + [n for n in by_name if n not in _roster]
-            rows_p = []
-            for n in order:
-                r = by_name.get(n)
-                rows_p.append({"name": n, "score": r["score"] if r else None, "max": r["max_score"] if r else 0,
-                               "comment": r["comment"] if r else ""})
-            pc1, pc2 = st.columns(2)
-            pc1.download_button("🖨️ كشف النقط للطباعة (Word)",
-                                create_grades_doc(rows_p, prof("language"), doc_meta(), st.session_state.get("class_name", ""),
-                                                  datetime.now().strftime("%d/%m/%Y")).getvalue(),
-                                f"Kachf_{safe_name(prof('subject'))}.docx", DOCX_MIME, use_container_width=True)
-            xb2 = io.BytesIO()
-            pd.DataFrame([{"ر.ت": i, "الاسم واللقب": r["name"], "القسم": st.session_state.get("class_name", ""),
-                           "المادة": prof("subject"), "المعهد": prof("school"),
-                           "العلامة": r["score"] if r["score"] is not None else "",
-                           "من": r["max"] or "", "الملاحظة": r["comment"]} for i, r in enumerate(rows_p, 1)]
-                         ).to_excel(xb2, index=False, sheet_name="كشف النقط")
-            pc2.download_button("⬇️ كشف النقط (Excel)", xb2.getvalue(), f"Kachf_{safe_name(prof('subject'))}.xlsx",
-                                XLSX_MIME, use_container_width=True)
-
-            # ---- تقرير القسم الكامل (Word / PDF) ----
-            if complete:
-                st.text_input("عنوان الامتحان (يظهر في التقرير)", key="exam_title_g", placeholder="مثال: فرض مراقبة عدد 1")
-                _rep = create_class_report_doc(results, prof("language"), doc_meta(), st.session_state.get("class_name", ""),
-                                               st.session_state.get("exam_title_g", ""), datetime.now().strftime("%d/%m/%Y")).getvalue()
-                rc1_, rc2_ = st.columns(2)
-                rc1_.download_button("📑 تقرير القسم كاملاً (Word)", _rep, f"Rapport_{safe_name(prof('subject'))}.docx",
-                                     DOCX_MIME, use_container_width=True)
-                _pdf = docx_to_pdf(_rep)
-                if _pdf:
-                    rc2_.download_button("📕 تقرير القسم كاملاً (PDF)", _pdf, f"Rapport_{safe_name(prof('subject'))}.pdf",
-                                         "application/pdf", use_container_width=True)
-                else:
-                    rc2_.caption("لتحويله إلى PDF: افتح ملف Word ثم «حفظ باسم» ← PDF.")
-
-
-            for i, r in enumerate(results):
-                with st.container(border=True):
-                    st.markdown(f"**📄 {r['student_name']} — {r['score']:g}/{r['max_score']:g}**")
-                    if r.get("questions"):
-                        st.dataframe(pd.DataFrame([{"السؤال": q["number"], "العلامة": q["score"], "من": q["max_score"], "ملاحظة": q["note"]}
-                                                   for q in r["questions"]]), hide_index=True, use_container_width=True)
-                    if r["strengths"]:
-                        st.markdown("**✅ نقاط القوة:** " + "؛ ".join(r["strengths"]))
-                    for mk in r["mistakes"]:
-                        st.markdown(f"- ❌ ({mk['category']}) {mk['description']}  \n  ✔️ {mk['correction']}")
-                    st.info(r["comment"])
-
-            if st.button("🧠 تحليل أخطاء القسم واقتراح حصة علاج", key="analyze"):
-                if require_credit():
-                    with st.spinner("جاري التحليل..."):
-                        try:
-                            summary = "\n".join(f"- ({mk['category']}) {mk['description']}" for r in results for mk in r["mistakes"])
-                            resp = llm(
-                                "text", temperature=0.4,
-                                messages=[{"role": "user", "content": f"""أنت مفتش تربوي. هذه أخطاء تلاميذ قسم في {prof('subject')} ({grade_label()}):
-    {summary}
-
-    1) لخّص أكثر الأخطاء تكراراً مرتبة حسب النسبة التقريبية.
-    2) حدّد الأسباب المحتملة.
-    3) اقترح حصة علاج مفصلة (الأهداف، الأنشطة، التمارين، التقييم) في حدود 45 دقيقة."""}])
-                            st.session_state.class_analysis = resp.choices[0].message.content
-                        except Exception as e:
-                            log.exception("class analysis")
-                            st.error(friendly_error(e))
-            if st.session_state.get("class_analysis"):
-                st.markdown(st.session_state.class_analysis)
+        if complete:
+            st.text_input("عنوان الامتحان (يظهر في التقرير)", key="exam_title_g", placeholder="مثال: فرض مراقبة عدد 1")
+            _rep = create_class_report_doc(results, prof("language"), doc_meta(), st.session_state.get("class_name", ""),
+                                           st.session_state.get("exam_title_g", ""), datetime.now().strftime("%d/%m/%Y")).getvalue()
+            rc1_, rc2_ = st.columns(2)
+            rc1_.download_button("📑 تقرير القسم كاملاً (Word)", _rep, f"Rapport_{safe_name(prof('subject'))}.docx",
+                                 DOCX_MIME, use_container_width=True)
+            _pdf = docx_to_pdf(_rep)
+            if _pdf:
+                rc2_.download_button("📕 تقرير القسم كاملاً (PDF)", _pdf, f"Rapport_{safe_name(prof('subject'))}.pdf",
+                                     "application/pdf", use_container_width=True)
