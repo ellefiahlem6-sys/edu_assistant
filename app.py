@@ -868,6 +868,7 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS accounts (email TEXT PRIMARY KEY, display_name TEXT, used INTEGER DEFAULT 0, created TEXT, profile TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS drafts (chat_id TEXT PRIMARY KEY, kind TEXT, data TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS grade_sets (owner TEXT PRIMARY KEY, data TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, owner TEXT, email TEXT, display TEXT, lesson_chat TEXT, exam_chat TEXT, created TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS events (ts TEXT, owner TEXT, kind TEXT, model TEXT, ok INTEGER, ms INTEGER, tokens INTEGER, err TEXT)""")
     if not using_pg():
         try:
@@ -1023,8 +1024,53 @@ def delete_account_data(email):
     conn.execute("DELETE FROM chats WHERE teacher=?", (email,))
     conn.execute("DELETE FROM grade_sets WHERE owner=?", (email,))
     conn.execute("DELETE FROM accounts WHERE email=?", (email,))
+    conn.execute("DELETE FROM sessions WHERE owner=?", (email,))
     conn.commit()
     conn.close()
+
+
+def session_create(user):
+    tok = uuid.uuid4().hex + uuid.uuid4().hex[:8]
+    try:
+        conn = db()
+        conn.execute("INSERT INTO sessions VALUES (?,?,?,?,?,?,?)",
+                     (tok, user["owner"], user.get("email") or "", user.get("display") or "", "", "", datetime.now().isoformat(timespec="seconds")))
+        conn.commit()
+        conn.close()
+    except Exception:
+        log.exception("session_create")
+    return tok
+
+
+def session_get(tok):
+    try:
+        conn = db()
+        row = conn.execute("SELECT owner, email, display, lesson_chat, exam_chat FROM sessions WHERE token=?", (tok,)).fetchone()
+        conn.close()
+        return row
+    except Exception:
+        log.exception("session_get")
+        return None
+
+
+def session_save_chats(tok, lesson, exam):
+    try:
+        conn = db()
+        conn.execute("UPDATE sessions SET lesson_chat=?, exam_chat=? WHERE token=?", (lesson, exam, tok))
+        conn.commit()
+        conn.close()
+    except Exception:
+        log.exception("session_save_chats")
+
+
+def session_drop(tok):
+    try:
+        conn = db()
+        conn.execute("DELETE FROM sessions WHERE token=?", (tok,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        log.exception("session_drop")
 
 
 def log_event(kind, model, ok, ms, tokens=0, err=""):
@@ -1892,6 +1938,8 @@ def email_box(key):
             name = get_or_create_account(e)
             st.session_state.clear()
             st.session_state.user = {"email": e, "owner": e, "display": name}
+            st.session_state["_tok"] = session_create(st.session_state.user)
+            st.query_params["s"] = st.session_state["_tok"]
             st.rerun()
 
 
@@ -1922,6 +1970,15 @@ button[kind="primary"]:hover, [data-testid="stBaseButton-primary"]:hover {
 </style>""", unsafe_allow_html=True)
 
 if "user" not in st.session_state:
+    _tok = st.query_params.get("s", "")
+    _row = session_get(_tok) if _tok else None
+    if _row:
+        st.session_state.user = {"owner": _row[0], "email": _row[1] or None, "display": _row[2] or "الأستاذ(ة)"}
+        st.session_state["_tok"] = _tok
+        st.session_state["_restore"] = (_row[3], _row[4])
+        st.rerun()
+
+if "user" not in st.session_state:
     st.title("🎓 المساعد التربوي الذكي")
     st.markdown("### حضّر جذاذاتك، ابنِ امتحاناتك، وصحّح أوراق تلاميذك بطريقتك أنت")
     c1, c2, c3 = st.columns(3)
@@ -1931,6 +1988,8 @@ if "user" not in st.session_state:
     st.divider()
     if st.button("🚀 ابدأ الآن مجاناً", type="primary", use_container_width=True):
         st.session_state.user = {"email": None, "owner": "guest:" + str(uuid.uuid4()), "display": "الأستاذ(ة)"}
+        st.session_state["_tok"] = session_create(st.session_state.user)
+        st.query_params["s"] = st.session_state["_tok"]
         st.rerun()
     st.caption("بالضغط على «ابدأ» أو بدخولك ببريدك فأنت توافق على سياسة الخصوصية، وتتحمّل مسؤولية استعمال أسماء التلاميذ وفق ضوابط مؤسستك.")
     st.markdown("**تريد حفظ ملفك وسجلك؟** ادخل ببريدك (بدون كلمة سر):")
@@ -1944,20 +2003,45 @@ init_profile_state()
 for _k in ("lesson", "exam"):
     if f"chat_id_{_k}" not in st.session_state:
         reset_chat(_k)
+_rs = st.session_state.pop("_restore", None)
+if _rs:
+    for _k, _cid in zip(("lesson", "exam"), _rs):
+        if _cid:
+            try:
+                load_chat(_cid, _k)
+            except Exception:
+                log.exception("restore chat")
+_tk = st.session_state.get("_tok")
+if _tk:
+    _cur = (st.session_state.get("chat_id_lesson", ""), st.session_state.get("chat_id_exam", ""))
+    if st.session_state.get("_saved_chats") != _cur:
+        session_save_chats(_tk, *_cur)
+        st.session_state["_saved_chats"] = _cur
 
 # =====================================================================
 # القائمة الجانبية: الحساب + السجل
 # =====================================================================
+def _end_session():
+    _t = st.session_state.get("_tok")
+    if _t:
+        session_drop(_t)
+    st.session_state.clear()
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
+
+
 with st.sidebar:
     if user["email"]:
         st.caption(f"👤 {user['email']}")
         if st.button("🚪 خروج", use_container_width=True):
-            st.session_state.clear()
+            _end_session()
             st.rerun()
     else:
         st.caption("👤 زائر — لن يُحفظ ملفك. ادخل ببريدك لحفظه.")
         if st.button("📧 دخول ببريدي", use_container_width=True):
-            st.session_state.clear()
+            _end_session()
             st.rerun()
     if LIMITS_ENABLED and user["email"]:
         st.metric("🎟️ المحاولات المتبقية", credits_left())
@@ -1998,7 +2082,7 @@ with st.sidebar:
             sure = st.checkbox("أؤكد حذف حسابي وكل محادثاتي نهائياً", key="confirm_delete")
             if st.button("🗑 احذف بياناتي", disabled=not sure, use_container_width=True):
                 delete_account_data(user["email"])
-                st.session_state.clear()
+                _end_session()
                 st.rerun()
         if ADMIN_EMAIL and user["email"] == ADMIN_EMAIL:
             with st.expander("🛠 لوحة المشرف"):
