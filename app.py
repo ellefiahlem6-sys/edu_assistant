@@ -1272,6 +1272,65 @@ def doc_to_text(name, data, limit=15000):
     return out.strip()[:limit]
 
 
+class UpFile:
+    """ملف مرفوع بعد تصحيح اسمه/امتداده حسب محتواه الحقيقي (واتساب وDrive كثيراً ما يحذفان الامتداد)."""
+
+    def __init__(self, name, data):
+        self.name, self._b, self.size = name, data, len(data)
+
+    def getvalue(self):
+        return self._b
+
+
+def sniff_ext(data, fallback=""):
+    h = data[:8]
+    if h.startswith(b"%PDF"):
+        return "pdf"
+    if h.startswith(b"\x89PNG"):
+        return "png"
+    if h.startswith(b"\xff\xd8"):
+        return "jpg"
+    if h.startswith(b"PK"):
+        try:
+            import zipfile
+            names = zipfile.ZipFile(io.BytesIO(data)).namelist()
+            if any(n.startswith("word/") for n in names):
+                return "docx"
+            if any(n.startswith("xl/") for n in names):
+                return "xlsx"
+            if any(n.startswith("ppt/") for n in names):
+                return "pptx"
+        except Exception:
+            pass
+    if h.startswith(b"\xd0\xcf\x11\xe0"):
+        return "xls"
+    return fallback
+
+
+def norm_files(x, allowed):
+    """يقبل أي ملف من الجهاز ثم يتحقق منه بمحتواه؛ يُرجع نفس الشكل (قائمة أو ملف واحد أو None)."""
+    single = not isinstance(x, (list, tuple))
+    items = [] if x is None else ([x] if single else list(x))
+    out = []
+    for f in items:
+        try:
+            data = f.getvalue()
+        except Exception:
+            continue
+        base = f.name.rsplit(".", 1)[0] if "." in f.name else f.name
+        old = f.name.rsplit(".", 1)[-1].lower() if "." in f.name else ""
+        ext = sniff_ext(data, old if old in allowed else "")
+        if ext == "jpg" and "jpeg" in allowed and "jpg" not in allowed:
+            ext = "jpeg"
+        if ext not in allowed:
+            st.warning(f"الملف «{f.name}» من نوع غير مدعوم. المدعوم: " + "، ".join(allowed))
+            continue
+        out.append(UpFile(f"{base}.{ext}", data))
+    if single:
+        return out[0] if out else None
+    return out
+
+
 def is_image_name(name):
     return name.lower().rsplit(".", 1)[-1] in IMG_TYPES
 
@@ -1591,7 +1650,7 @@ def workshop(kind, placeholder, system_fn, turn_cls, temperature):
     with box:
         for m in st.session_state[mk]:
             render_message(m)
-    prompt = st.chat_input(placeholder, accept_file="multiple", file_type=IMG_TYPES + DOC_TYPES, key=f"input_{kind}")
+    prompt = st.chat_input(placeholder, accept_file="multiple", key=f"input_{kind}")
     if not prompt:
         return
     if not require_credit():
@@ -1601,7 +1660,7 @@ def workshop(kind, placeholder, system_fn, turn_cls, temperature):
     if text is None:
         text = str(prompt)
     text = text.strip()
-    _all = list(getattr(prompt, "files", None) or [])
+    _all = norm_files(list(getattr(prompt, "files", None) or []), IMG_TYPES + DOC_TYPES)
     files = [shrink(f.getvalue()) for f in _all if is_image_name(f.name)]
     doc_texts = [(f.name, read_any(f.name, f.getvalue())) for f in _all if not is_image_name(f.name)]
 
@@ -1744,6 +1803,11 @@ def preview_lesson(lang, attach):
     d = st.session_state.get("draft_lesson")
     if not d:
         st.info("📄 ستظهر هنا مسودة الجذاذة بعد أن تحدثني عن الدرس.")
+        _c1, _c2 = st.columns(2)
+        _c1.button("⬇️ تحميل Word", disabled=True, use_container_width=True, key="ph_word")
+        _c2.button("📕 تحميل PDF", disabled=True, use_container_width=True, key="ph_pdf")
+        st.button("🖥️ اعرض الدرس على الشاشة (حائط أو سبّورة)", disabled=True, use_container_width=True, key="ph_show")
+        st.caption("تعمل هذه الأزرار بعد تحضير جذاذتك: اكتب عنوان الدرس في المحادثة.")
         return
     st.caption("✨ المسودة جاهزة: عدّلها بالكلام كما تشاء قبل التحميل.")
     st.markdown(f"### {d['title']}")
@@ -1753,8 +1817,15 @@ def preview_lesson(lang, attach):
             st.markdown(b["content"])
     set_accent(accent_for("lesson"))
     data = create_lesson_doc(d, lang, doc_meta(), chat_images("lesson") if attach else None).getvalue()
-    st.download_button("⬇️ تحميل الجذاذة (Word)", data, f"Jadhatha_{safe_name(prof('subject'))}_{safe_name(grade_label())}.docx",
-                       DOCX_MIME, type="primary", use_container_width=True)
+    _dw, _dp = st.columns(2)
+    _dw.download_button("⬇️ تحميل Word", data, f"Jadhatha_{safe_name(prof('subject'))}_{safe_name(grade_label())}.docx",
+                        DOCX_MIME, type="primary", use_container_width=True)
+    _lpdf = docx_to_pdf(data)
+    if _lpdf:
+        _dp.download_button("📕 تحميل PDF", _lpdf, f"Jadhatha_{safe_name(prof('subject'))}_{safe_name(grade_label())}.pdf",
+                            "application/pdf", use_container_width=True)
+    else:
+        _dp.button("📕 تحميل PDF", disabled=True, use_container_width=True, key="pdf_na", help="يتوفر عند تفعيل ملف packages.txt على الخادم. يمكنك حفظ ملف Word كـ PDF من Word.")
 
     # ---- عرض الدرس على الشاشة ----
     import hashlib
@@ -2144,7 +2215,7 @@ def profile_ui():
 
     with st.expander("✨ قلّدني: ارفع وثيقة سابقة لك ليتعلّم التطبيق أسلوبك"):
         kind_label = st.radio("نوع الوثيقة", ["جذاذة", "امتحان"], horizontal=True, key="mimic_kind")
-        imgs = st.file_uploader("صور أو ملف الوثيقة (صور، Word، Excel، PDF)", type=IMG_TYPES + DOC_TYPES, accept_multiple_files=True, key="mimic_files")
+        imgs = norm_files(st.file_uploader("صور أو ملف الوثيقة (صور، Word، Excel، PDF)", accept_multiple_files=True, key="mimic_files"), IMG_TYPES + DOC_TYPES)
         if st.button("🔍 حلّل أسلوبي", key="mimic_go"):
             if not imgs:
                 st.warning("ارفع ملفاً واحداً على الأقل.")
@@ -2277,10 +2348,10 @@ with tab_grader:
     else:
         with st.container(border=True):
             st.markdown("**ارفع الامتحان والبارم** (صور، Word، Excel، PDF)")
-            exam_files = st.file_uploader("ورقة الامتحان", type=IMG_TYPES + DOC_TYPES, accept_multiple_files=True, key="exam_files")
+            exam_files = norm_files(st.file_uploader("ورقة الامتحان", accept_multiple_files=True, key="exam_files"), IMG_TYPES + DOC_TYPES)
             barem_text = st.text_area("البارم: اكتبه هنا", key="barem_text", height=90,
                                       placeholder="مثال: س1 (4 ن): التعريف ... / س2 (6 ن): ...")
-            barem_file = st.file_uploader("أو ارفع البارم", type=IMG_TYPES + DOC_TYPES, key="barem_file")
+            barem_file = norm_files(st.file_uploader("أو ارفع البارم", key="barem_file"), IMG_TYPES + DOC_TYPES)
             _ek = (tuple((f.name, getattr(f, "size", 0)) for f in (exam_files or [])),
                    (barem_file.name, getattr(barem_file, "size", 0)) if barem_file else None)
             _ec = st.session_state.get("_exam_cache")
@@ -2304,15 +2375,15 @@ with tab_grader:
                 no_key_ok = st.checkbox("أصحّح دون بارم (دقة أقل)", key="no_key_ok")
 
     # ===== الأوراق + زر التصحيح + إعدادات القسم (مطوية) =====
+    _classbox = st.container(border=True)
     _students = st.container()
     _btn = st.container()
     _settings = st.expander("⚙️ إعدادات القسم والخيارات المتقدمة")
     with _settings:
-        st.text_input("اسم القسم (مثال: 7 أساسي 2)", key="class_name")
         st.markdown("**قائمة أسماء القسم (اختيارية)**")
         st.caption("ارفع ملف Excel/CSV فيه عمود الأسماء، أو الصق الأسماء (اسم في كل سطر).")
         rc1, rc2 = st.columns(2)
-        roster_file = rc1.file_uploader("ملف القسم", type=["xlsx", "csv"], key="roster_file")
+        roster_file = norm_files(rc1.file_uploader("ملف القسم", key="roster_file"), ["xlsx", "xls", "csv"])
         roster_text = rc2.text_area("أو الصق الأسماء", key="roster_text", height=120)
         st.radio("كيف تُربط العلامات بالأسماء؟",
                  ["يقرأ المساعد الاسم من الورقة ويطابقه مع القائمة",
@@ -2325,11 +2396,24 @@ with tab_grader:
             st.success(f"عدد التلاميذ في القائمة: {len(st.session_state.roster)}")
         if _r and not st.session_state.get("class_size"):
             st.session_state["class_size"] = len(_r)
+    with _classbox:
+        _ex = {"العربية": ("📋 جدول تنقيط القسم", "سجّل اسم القسم وعدد تلاميذه، ثم صحّح أوراقهم واحدة بعد أخرى؛ تتجمع النقط تلقائيًا في جدول واحد (فيه المادة والأستاذ والمؤسسة) تحمّله Word أو PDF أو Excel.",
+                           "مثال لما ستحصل عليه", ["ر.ت", "الاسم واللقب", "العلامة /20"], [[1, "أحمد بن علي", 15.5], [2, "سلمى الطرابلسي", 12], [3, "يوسف الجلاصي", 17.25]]),
+               "الفرنسية": ("📋 Tableau des notes de la classe", "Indiquez le nom de la classe et son effectif, puis corrigez les copies une à une : les notes se regroupent dans un seul tableau (matière, enseignant, établissement) à télécharger en Word, PDF ou Excel.",
+                            "Exemple de résultat", ["N°", "Nom et prénom", "Note /20"], [[1, "Ahmed Ben Ali", 15.5], [2, "Salma Trabelsi", 12], [3, "Youssef Jlassi", 17.25]]),
+               "الإنجليزية": ("📋 Class grade sheet", "Enter the class name and size, then grade papers one by one: marks are collected into a single table (subject, teacher, school) you can download as Word, PDF or Excel.",
+                              "Example of the result", ["No.", "Student", "Mark /20"], [[1, "Ahmed Ben Ali", 15.5], [2, "Salma Trabelsi", 12], [3, "Youssef Jlassi", 17.25]])}
+        _t = _ex.get(prof("language"), _ex["العربية"])
+        st.markdown(f"#### {_t[0]}")
+        st.caption(_t[1])
+        st.text_input("اسم القسم (مثال: 7 أساسي 2)", key="class_name")
         cs1, cs2 = st.columns(2)
         class_size = int(cs1.number_input("عدد تلاميذ القسم (0 = غير محدد)", min_value=0, max_value=60, step=1, key="class_size"))
         absent = int(cs2.number_input("عدد الغائبين", min_value=0, max_value=max(class_size, 1), step=1, key="absent_n")) if class_size else 0
-        grade_mode = st.radio("طريقة إضافة الأوراق", ["تلميذ بتلميذ (الأسهل)", "دفعة واحدة (صور مرتبة)"],
-                              horizontal=True, key="grade_mode")
+        if not st.session_state.get("grades"):
+            st.caption(f"👇 {_t[2]}:")
+            st.dataframe(pd.DataFrame(_t[4], columns=_t[3]), hide_index=True, use_container_width=True)
+        grade_mode = "تلميذ بتلميذ (الأسهل)"
         grading_instructions = st.text_area("شروط التصحيح وسلّم التنقيط", "صحّح الورقة بدقة وموضوعية دون تساهل، وأعطِ علامة مع ملاحظة بيداغوجية.", key="grading_text")
     _roster = st.session_state.get("roster") or []
     _by_order = bool(_roster) and str(st.session_state.get("roster_mode", "")).startswith("حسب")
@@ -2360,8 +2444,8 @@ with tab_grader:
     batch = not str(grade_mode).startswith("تلميذ")
     groups_in = []
     with _students:
-        st.caption("📱 من الهاتف: فعّل «صوّر بالكاميرا» داخل بطاقة التلميذ لتصوير الورقة دون مغادرة الصفحة، أو ارفع صورًا من المعرض.")
-        if not batch:
+        st.caption("📱 صوّر الورقة بتطبيق الكاميرا (أو Google Drive Scan) ثم ارفعها هنا. لكل تلميذ بطاقة تتّسع لكل صفحاته.")
+        if True:
             if "n_students" not in st.session_state:
                 st.session_state.n_students = 1
 
@@ -2382,39 +2466,15 @@ with tab_grader:
                         nm = "" if str(pick).startswith("(") else pick
                     else:
                         nm = str(ca_.text_input(f"اسم التلميذ {k + 1} (اختياري)", key=f"stu_name_{k}")).strip()
-                    fs = cb_.file_uploader("صور ورقته (كل الصفحات) أو ملف PDF", type=IMG_TYPES + ["pdf"], accept_multiple_files=True,
-                                           key=f"stu_files_{k}")
+                    fs = norm_files(cb_.file_uploader("صور ورقته (كل الصفحات) أو ملف PDF", accept_multiple_files=True,
+                                                      key=f"stu_files_{k}"), IMG_TYPES + ["pdf"])
                     _pg = expand_pages(list(fs)) if fs else []
-                    _cp = st.session_state.get(f"cam_pages_{k}", [])
-                    if cb_.checkbox("📷 صوّر بالكاميرا (دون مغادرة الصفحة)", key=f"cam_on_{k}"):
-                        _n = int(st.session_state.get(f"cam_n_{k}", 0))
-                        _shot = cb_.camera_input("صوّر الصفحة", key=f"cam_{k}_{_n}", label_visibility="collapsed")
-                        if _shot is not None and cb_.button("➕ أضف هذه الصفحة", key=f"cam_add_{k}_{_n}"):
-                            st.session_state.setdefault(f"cam_pages_{k}", []).append(_shot.getvalue())
-                            st.session_state[f"cam_n_{k}"] = _n + 1
-                            st.rerun()
-                    if _cp:
-                        cb_.caption(f"📷 {len(_cp)} صفحة مصوَّرة")
-                        if cb_.button("حذف الصور المصوَّرة", key=f"cam_clr_{k}"):
-                            st.session_state[f"cam_pages_{k}"] = []
-                            st.rerun()
-                        _pg = _pg + [PageImg(f"camera_{k}_{i}.jpg", b) for i, b in enumerate(_cp, 1)]
                     if _pg:
                         groups_in.append((_pg, nm))
             bc1, bc2, _sp = st.columns([1, 1, 3])
             bc1.button("➕ تلميذ آخر", on_click=_add_student, key="add_stu",
                        disabled=bool(class_size) and int(st.session_state.n_students) >= _left)
             bc2.button("➖ حذف الأخير", on_click=_del_student, key="del_stu")
-        else:
-            student_imgs = st.file_uploader("أوراق التلاميذ", type=IMG_TYPES + ["pdf"], accept_multiple_files=True, key="student_files")
-            pages_per = st.number_input("عدد صفحات (صور) ورقة كل تلميذ", min_value=1, max_value=10, value=1, step=1, key="pages_per",
-                                        help="1 = كل صورة تلميذ مختلف. ضع 5 مثلاً إن كان لكل تلميذ 5 صفحات: سترفعها مرتبة.")
-            if student_imgs:
-                _imgs = expand_pages(list(student_imgs))
-                _n = int(pages_per)
-                groups_in = [(list(_imgs[j:j + _n]), "") for j in range(0, len(_imgs), _n)]
-                if _n > 1:
-                    st.caption(f"سيُصحَّح {len(groups_in)} تلميذ(ة) من {len(_imgs)} صورة. رتّب الصور بحيث تتتالى صفحات كل تلميذ.")
         if class_size and len(groups_in) > _left:
             st.warning(f"المتبقي في القسم {_left} تلميذ(ة) فقط؛ سيُعالج أول {_left} فقط.")
             groups_in = groups_in[:_left]
