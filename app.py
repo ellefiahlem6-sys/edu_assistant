@@ -1,5 +1,6 @@
 import base64
 import functools
+import hashlib
 import io
 import json
 import logging
@@ -141,6 +142,9 @@ LABELS = {
         "total": "المجموع", "answer": "الإصلاح", "name": "الاسم واللقب", "cls": "القسم", "mark": "العدد",
         "partw": "الجزء", "grading": "جدول التنقيط", "luck": "بالتوفيق", "topic": "الموضوع",
         "lesson": "الدرس", "field": "مدار الاهتمام",
+        "secret": "وثيقة الأستاذ — لا تُسلَّم للتلميذ",
+        "mark_rules": "تُقبل كل إجابة تؤدّي المعنى نفسه. النقاط من مضاعفات 0.25، ولا تُمنح العلامة كاملة إلا إذا استوفى الجواب كل العناصر.",
+        "elements": "عناصر الإجابة وتوزيع النقاط",
     },
     "الفرنسية": {
         "ministry": "République Tunisienne\nMinistère de l'Éducation", "prof": "Prof", "subj": "Matière", "level_": "Niveau",
@@ -149,6 +153,9 @@ LABELS = {
         "total": "Total", "answer": "Corrigé", "name": "Nom et prénom", "cls": "Classe", "mark": "Note",
         "partw": "Partie", "grading": "Barème", "luck": "Bon travail", "topic": "Sujet",
         "lesson": "Leçon", "field": "Centre d'intérêt",
+        "secret": "Document de l'enseignant — à ne pas remettre à l'élève",
+        "mark_rules": "Toute formulation équivalente est acceptée. Les points sont des multiples de 0,25. La note complète n'est donnée que si tous les éléments sont présents.",
+        "elements": "Éléments de réponse et répartition des points",
     },
     "الإنجليزية": {
         "ministry": "Republic of Tunisia\nMinistry of Education", "prof": "Teacher", "subj": "Subject", "level_": "Level",
@@ -157,6 +164,9 @@ LABELS = {
         "total": "Total", "answer": "Answer", "name": "Full name", "cls": "Class", "mark": "Mark",
         "partw": "Part", "grading": "Marking grid", "luck": "Good luck", "topic": "Topic",
         "lesson": "Lesson", "field": "Theme",
+        "secret": "Teacher's copy — do not give to the student",
+        "mark_rules": "Any answer that carries the same meaning is accepted. Marks are in steps of 0.25. Full marks only when every element is present.",
+        "elements": "Expected elements and mark breakdown",
     },
 }
 DUR_FR = {"ساعة واحدة": "1h", "ساعتان": "2h", "3 ساعات": "3h", "4 ساعات": "4h"}
@@ -650,6 +660,9 @@ def create_answer_key_doc(exam, lang, m):
         cell_text(cells[3], f"{q['points']:g}", lang, 10)
     spacer(doc, 10)
 
+    add_par(doc, L["secret"], lang, "center", True, 12, after=2)
+    add_par(doc, L["mark_rules"], lang, "center", False, 10, after=8)
+
     n = 0
     for part in exam["parts"]:
         ptot = round(sum(q["points"] for q in part["questions"]), 2)
@@ -659,13 +672,21 @@ def create_answer_key_doc(exam, lang, m):
         spacer(doc, 6)
         for q in part["questions"]:
             n += 1
-            add_par(doc, f"{n}-  ({q['points']:g} {L['pts']})", lang, "start", True, 12, after=2)
-            add_markdown(doc, q["text"], lang, 12)
+            box = make_table(doc, 2, [PAGE_W - 1.15, 1.15], lang)
+            add_markdown(box.cell(0, 0), f"**{n}.** {q['text']}", lang, 11, width=PAGE_W - 1.4)
             png = chart_png(q.get("chart"), lang)
             if png:
-                add_figure(doc, png, 4.0)
-            add_markdown(doc, f"**{L['answer']}:** {q['answer']}", lang, 12)
-            spacer(doc, 10)
+                add_figure(box.cell(0, 0), png, 4.0)
+            cell_text(box.cell(0, 1), f"{q['points']:g}\n{L['pts']}", lang, 12, True)
+            shade(box.cell(0, 1), "F2F2F2")
+            box.rows[1].cells[0].merge(box.rows[1].cells[1])
+            shade(box.cell(1, 0), "F7F1E8")
+            add_markdown(
+                box.cell(1, 0),
+                f"**{L['elements']}**\n\n{q.get('answer') or '—'}",
+                lang, 11, width=PAGE_W - 0.35,
+            )
+            spacer(doc, 8)
     add_par(doc, f"{L['total']}: {exam_total(exam):g}", lang, "center", True, 13)
     return finish(doc)
 
@@ -1304,7 +1325,28 @@ def sniff_ext(data, fallback=""):
             pass
     if h.startswith(b"\xd0\xcf\x11\xe0"):
         return "xls"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    if h.startswith(b"GIF8"):
+        return "gif"
+    if h.startswith(b"BM"):
+        return "bmp"
     return fallback
+
+
+def coerce_image(data):
+    """يحوّل أي صورة يفتحها الجهاز (حتى بلا امتداد، أو webp) إلى JPEG."""
+    try:
+        from PIL import Image, ImageOps
+
+        im = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+        if im.mode != "RGB":
+            im = im.convert("RGB")
+        out = io.BytesIO()
+        im.save(out, "JPEG", quality=90)
+        return out.getvalue()
+    except Exception:
+        return None
 
 
 def norm_files(x, allowed):
@@ -1317,18 +1359,58 @@ def norm_files(x, allowed):
             data = f.getvalue()
         except Exception:
             continue
+        if not data:
+            continue
         base = f.name.rsplit(".", 1)[0] if "." in f.name else f.name
         old = f.name.rsplit(".", 1)[-1].lower() if "." in f.name else ""
         ext = sniff_ext(data, old if old in allowed else "")
         if ext == "jpg" and "jpeg" in allowed and "jpg" not in allowed:
             ext = "jpeg"
+        if ext in ("webp", "gif", "bmp", "jpeg") or ext not in allowed:
+            img = coerce_image(data)
+            if img and any(t in allowed for t in ("jpg", "jpeg", "png")):
+                out.append(UpFile(f"{base}.jpg", img))
+                continue
         if ext not in allowed:
             st.warning(f"الملف «{f.name}» من نوع غير مدعوم. المدعوم: " + "، ".join(allowed))
             continue
-        out.append(UpFile(f"{base}.{ext}", data))
+        out.append(UpFile(f"{base}.{ext}" if ext else base, data))
     if single:
         return out[0] if out else None
     return out
+
+
+def _digest(data):
+    return hashlib.sha1(data).hexdigest()[:12]
+
+
+def sources_box(key, *, multiple=True, allowed=None, camera=True,
+                camera_label="📸 افتح الكاميرا وصوّر الآن",
+                file_label="📁 أو اختر من الصور والملفات"):
+    """كاميرا تفتح مباشرة، ثم أي صورة أو ملف من الجهاز. الصور تُجمع حتى لو التقطت واحدة بعد أخرى."""
+    allowed = allowed or (IMG_TYPES + DOC_TYPES)
+    bag = st.session_state.setdefault(f"_shots_{key}", [])
+    dismissed = st.session_state.setdefault(f"_shot_dismiss_{key}", set())
+    if camera:
+        cam = st.camera_input(camera_label, key=f"{key}_cam")
+        if cam is not None:
+            raw = cam.getvalue()
+            sid = _digest(raw)
+            if raw and sid not in dismissed and sid not in {x[0] for x in bag}:
+                bag.append((sid, f"صورة_{len(bag) + 1}.jpg", coerce_image(raw) or raw))
+    up = st.file_uploader(file_label, accept_multiple_files=multiple, key=f"{key}_up")
+    uploaded = norm_files(list(up) if up else [], allowed)
+    if bag:
+        st.caption(f"صور الكاميرا الجاهزة: {len(bag)}. لالتقاط صفحة أخرى اضغط ✕ على الكاميرا ثم صوّر من جديد.")
+        cols = st.columns(min(len(bag), 4))
+        for i, (sid, name, data) in enumerate(list(bag)):
+            col = cols[i % len(cols)]
+            col.image(data, caption=name, use_container_width=True)
+            if col.button("حذف", key=f"{key}_del_{sid}"):
+                dismissed.add(sid)
+                st.session_state[f"_shots_{key}"] = [x for x in bag if x[0] != sid]
+                st.rerun()
+    return [UpFile(name, data) for _, name, data in bag] + list(uploaded or [])
 
 
 def is_image_name(name):
@@ -1574,7 +1656,13 @@ def exam_system(exam_title, total):
 1. إن لم يحدد الأستاذ بعد مواضيع الامتحان أو مصدر الأسئلة (درس، صورة، موضوع)، فاسأله في reply وأعد draft = null. لا تخترع أسئلة عامة لا علاقة بدروسه.
 2. إن حدد المواضيع ولم يحدد الأجزاء، فابنِ مسودة أولى بهيكل مناسب لمادته، وأخبره في reply بما اخترت ليعدّله.
 3. مجموع نقاط كل الأسئلة = {total:g} بالضبط (من إعدادات الفرض)، والنقاط من مضاعفات 0.25.
-4. لكل سؤال: text (نص السؤال فقط، بلا ترقيم ولا نقاط)، points، level (معرفة/تطبيق/تحليل)، objective (الهدف التعلمي)، answer (الإصلاح النموذجي المختصر مع توزيع النقاط عند الحاجة)، lines (عدد أسطر مساحة الإجابة من 0 إلى 12، متناسب مع النقاط وطول الجواب المتوقع، و0 للاختيار من متعدد). title في المسودة هو عنوان موضوع الفرض.
+4. لكل سؤال: text (نص السؤال فقط، بلا ترقيم ولا نقاط)، points، level (معرفة/تطبيق/تحليل)، objective (الهدف التعلمي)، lines (عدد أسطر مساحة الإجابة من 0 إلى 12، متناسب مع النقاط وطول الجواب المتوقع، و0 للاختيار من متعدد). title في المسودة هو عنوان موضوع الفرض.
+   answer هو سلّم إصلاح يكتبه أستاذ تونسي للتصحيح، لا ملخصاً عاماً:
+   - عناصر الإجابة، كل عنصر في سطر يبدأ بـ «-»، وأمامه نقاطه بين قوسين مثل (0.5) أو (1).
+   - مجموع نقاط العناصر = points بالضبط، والنقاط من مضاعفات 0.25.
+   - سطر «يُقبل:» لما يُعدّ صحيحاً ولو اختلفت الصياغة، وسطر «لا يُقبل:» للخطأ الذي يُصفّر العنصر.
+   - في الأسئلة العددية: الناتج والوحدة، والخطوات التي تُحتسب والتي لا تُحتسب.
+   - لا تكتب «إجابة نموذجية» بلا توزيع نقاط.
 5. عند أي طلب تعديل (أضف سؤالاً/احذف/غيّر النقاط/بدّل الجزء) عدّل المسودة الحالية وأعدها كاملة في draft مع الحفاظ على المجموع {total:g}. إن أخلّ الطلب بالمجموع فعدّل نقاطاً أخرى وأخبره بذلك.
 6. الأسئلة مناسبة لمستوى {grade_label()} وتغطي مستويات معرفية متنوعة.
 7. تحقق داخلياً من صحة الأسئلة والإصلاح، ولا تكتب هذه المراجعة.
@@ -1591,8 +1679,8 @@ def exam_system(exam_title, total):
 # ورشة المحادثة
 # =====================================================================
 GREETINGS = {
-    "lesson": "أهلاً بك 👋 اكتب عنوان الدرس (وارفع صورة صفحته إن شئت)، وسنبني الجذاذة معاً، ثم تعدّلها بالكلام: أضف، احذف، غيّر.",
-    "exam": "أهلاً بك 👋 أخبرني بمواضيع الفرض (أو ارفع صفحات الدروس) وكيف تريد الأجزاء والنقاط، وسأبني المسودة وتعدّلها معي.",
+    "lesson": "أهلاً بك. اكتب عنوان الدرس، أو صوّر صفحته بالكاميرا من الأسفل. نبني الجذاذة ثم تعدّلها بكلامك: أضف، احذف، غيّر.",
+    "exam": "أهلاً بك. أخبرني بمواضيع الفرض، أو صوّر صفحات الدرس. أحدد معك الأجزاء والنقاط، ويخرج الفرض مع سلّم إصلاح جاهز للتصحيح.",
 }
 
 
@@ -1646,21 +1734,39 @@ def render_message(m):
 
 def workshop(kind, placeholder, system_fn, turn_cls, temperature):
     mk, ik, dk = f"messages_{kind}", f"chat_id_{kind}", f"draft_{kind}"
+    with st.expander("📸 صوّر صفحة أو أرفق أي ملف", expanded=False):
+        st.caption("علّم «فتح الكاميرا» لتلتقط الصفحة مباشرة، أو اختر صورة من المعرض أو ملفاً من واتساب وDrive حتى لو بلا امتداد.")
+        _cam_on = st.checkbox("فتح الكاميرا", key=f"cam_on_{kind}")
+        grabbed = sources_box(f"chat_{kind}", camera=_cam_on)
+        if st.button("أرفقها للمحادثة وابنِ عليها", key=f"attach_{kind}", type="primary", use_container_width=True):
+            if not grabbed:
+                st.warning("صوّر صفحة أو اختر ملفاً أولاً.")
+            else:
+                st.session_state[f"force_turn_{kind}"] = (
+                    "هذه صفحات أرفقتها. استخرج محتواها وابنِ عليه وفق طريقتي.",
+                    grabbed,
+                )
+                st.session_state[f"_shots_chat_{kind}"] = []
+                st.rerun()
     box = st.container(height=420, border=True)
     with box:
         for m in st.session_state[mk]:
             render_message(m)
     prompt = st.chat_input(placeholder, accept_file="multiple", key=f"input_{kind}")
-    if not prompt:
+    forced = st.session_state.pop(f"force_turn_{kind}", None)
+    if not prompt and not forced:
         return
     if not require_credit():
         return
 
-    text = getattr(prompt, "text", None)
-    if text is None:
-        text = str(prompt)
-    text = text.strip()
-    _all = norm_files(list(getattr(prompt, "files", None) or []), IMG_TYPES + DOC_TYPES)
+    if forced:
+        text, _all = forced
+    else:
+        text = getattr(prompt, "text", None)
+        if text is None:
+            text = str(prompt)
+        text = text.strip()
+        _all = norm_files(list(getattr(prompt, "files", None) or []), IMG_TYPES + DOC_TYPES)
     files = [shrink(f.getvalue()) for f in _all if is_image_name(f.name)]
     doc_texts = [(f.name, read_any(f.name, f.getvalue())) for f in _all if not is_image_name(f.name)]
 
@@ -1915,7 +2021,7 @@ def preview_exam(lang, meta, target, attach):
     else:
         st.success(f"✅ المجموع {tot:g}")
 
-    t_prev, t_edit, t_spec = st.tabs(["👁️ المعاينة", "✏️ تعديل مباشر", "📊 جدول المواصفات"])
+    t_prev, t_edit, t_key, t_spec = st.tabs(["👁️ ورقة التلميذ", "✏️ تعديل مباشر", "🔑 سلّم الإصلاح", "📊 جدول المواصفات"])
     with t_prev:
         if d.get("title"):
             st.markdown(f"### {d['title']}")
@@ -1930,14 +2036,16 @@ def preview_exam(lang, meta, target, attach):
                 if png:
                     st.image(png, width=380)
     with t_edit:
-        st.caption("عدّل نص السؤال أو نقاطه أو مستواه مباشرة. ولتغيير بنية الامتحان (إضافة، حذف، أجزاء) اكتب لي في المحادثة.")
-        rows = [{"الجزء": pt, "السؤال": q["text"], "النقاط": float(q["points"]), "المستوى": q["level"]} for pt, q in all_questions(d)]
+        st.caption("عدّل السؤال أو نقاطه أو سلّم إصلاحه. لتغيير عدد الأسئلة أو الأجزاء اكتب ذلك في المحادثة.")
+        rows = [{"الجزء": pt, "السؤال": q["text"], "النقاط": float(q["points"]), "المستوى": q["level"],
+                 "سلّم الإصلاح": q.get("answer") or ""} for pt, q in all_questions(d)]
         edited = st.data_editor(
             pd.DataFrame(rows), key=f"ed_exam_{ver}", hide_index=True, use_container_width=True, disabled=["الجزء"],
             column_config={
-                "السؤال": st.column_config.TextColumn(width="large"),
+                "السؤال": st.column_config.TextColumn(width="medium"),
                 "النقاط": st.column_config.NumberColumn(min_value=0.0, step=0.25),
                 "المستوى": st.column_config.SelectboxColumn(options=["معرفة", "تطبيق", "تحليل"]),
+                "سلّم الإصلاح": st.column_config.TextColumn(width="large"),
             },
         )
         changed, i = False, 0
@@ -1946,16 +2054,30 @@ def preview_exam(lang, meta, target, attach):
                 row = edited.iloc[i]
                 i += 1
                 txt, pts, lvl = row["السؤال"], row["النقاط"], row["المستوى"]
+                ans = row["سلّم الإصلاح"]
                 if isinstance(txt, str) and txt.strip() and txt != q["text"]:
                     q["text"], changed = txt, True
                 if pts is not None and not pd.isna(pts) and float(pts) != float(q["points"]):
                     q["points"], changed = float(pts), True
                 if lvl in ("معرفة", "تطبيق", "تحليل") and lvl != q["level"]:
                     q["level"], changed = lvl, True
+                if isinstance(ans, str) and ans != (q.get("answer") or ""):
+                    q["answer"], changed = ans, True
         if changed:
             save_draft(chat_id, "exam", d)
             st.session_state.pop("exam_b", None)
             st.rerun()
+    with t_key:
+        st.caption("سلّم الإصلاح كما يُطبع للأستاذ: كل عنصر بنقاطه. ما تعدّله في «تعديل مباشر» يظهر هنا وفي ملف Word.")
+        n = 0
+        for part in d["parts"]:
+            ptot = round(sum(q["points"] for q in part["questions"]), 2)
+            st.markdown(f"#### {part['title']} — {ptot:g} {L['pts']}")
+            for q in part["questions"]:
+                n += 1
+                st.markdown(f"**{n}.** {q['text']}")
+                st.caption(f"{q['points']:g} {L['pts']} · {q['level']}")
+                st.info(q.get("answer") or "لم يُكتب سلّم هذا السؤال بعد. اطلب في المحادثة: اكتب سلّم الإصلاح عنصراً بعنصر.")
     with t_spec:
         qs = all_questions(d)
         df = pd.DataFrame([{"السؤال": i, "الجزء": pt, "الهدف": q["objective"], "المستوى": q["level"], "النقاط": q["points"]}
@@ -1967,9 +2089,9 @@ def preview_exam(lang, meta, target, attach):
     base = f"{safe_name(prof('subject'))}_{safe_name(grade_label())}"
     c1, c2 = st.columns(2)
     set_accent(accent_for("exam"))
-    c1.download_button("⬇️ ورقة الامتحان", create_exam_doc(d, lang, meta, imgs).getvalue(), f"Examen_{base}.docx",
+    c1.download_button("⬇️ ورقة التلميذ للطباعة", create_exam_doc(d, lang, meta, imgs).getvalue(), f"Examen_{base}.docx",
                        DOCX_MIME, type="primary", use_container_width=True)
-    c2.download_button("⬇️ ملف الإصلاح (للأستاذ)", create_answer_key_doc(d, lang, meta).getvalue(), f"Corrige_{base}.docx",
+    c2.download_button("⬇️ سلّم الإصلاح (للأستاذ)", create_answer_key_doc(d, lang, meta).getvalue(), f"Corrige_{base}.docx",
                        DOCX_MIME, use_container_width=True)
 
     if st.button("🔀 توليد نسخة B (لمنع الغش)", use_container_width=True):
@@ -1978,7 +2100,8 @@ def preview_exam(lang, meta, target, attach):
                 try:
                     b = parse_structured(
                         [{"role": "system", "content": f"أعد كتابة هذا الامتحان كنسخة B مكافئة في الصعوبة والأهداف والمستويات وعدد الأسئلة ومجموع النقاط ({target:g})، "
-                                                      f"مع تغيير الأرقام والأمثلة والصياغة، وحافظ على نفس الأجزاء. اللغة: {lang}. أعد أيضاً الإصلاح لكل سؤال."},
+                                                      f"مع تغيير الأرقام والأمثلة والصياغة، وحافظ على نفس الأجزاء. اللغة: {lang}. "
+                                                      f"لكل سؤال اكتب سلّم إصلاح بعناصر، أمام كل عنصر نقاطه، ومجموع العناصر يساوي نقاط السؤال بالضبط."},
                          {"role": "user", "content": json.dumps(d, ensure_ascii=False)}],
                         ExamModel, 0.6).model_dump()
                     if abs(exam_total(b) - target) > 0.01:
@@ -2025,19 +2148,52 @@ PRIVACY_TEXT = """
 CONTACT_EMAIL = _setting("CONTACT_EMAIL", "")
 ADMIN_EMAIL = _setting("ADMIN_EMAIL", "").strip().lower()
 
-st.set_page_config(page_title="المساعد التربوي الذكي", page_icon="🎓", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="مكتبي البيداغوجي", page_icon="🎓", layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""<style>
+:root { --ink:#1a2744; --paper:#f4efe6; --red:#8E1B2C; --red-d:#6d1220; --gold:#c4a35a; }
+.stApp { background: var(--paper); color: #1c1917; }
+[data-testid="stHeader"] { background: transparent; }
+h1, h2, h3 { color: var(--ink) !important; letter-spacing: -0.02em; }
+[data-testid="stCaption"] { color: #5c5346 !important; }
 [data-testid="stExpandSidebarButton"], [data-testid="collapsedControl"] {
-  width: auto !important; background: #0e8a6a; color: #fff !important; border-radius: 20px; padding: 4px 12px; }
+  width: auto !important; background: var(--ink); color: #fff !important; border-radius: 999px; padding: 6px 14px; }
 button[kind="primary"], [data-testid="stBaseButton-primary"] {
-  background-color: #0e8a6a !important; border-color: #0e8a6a !important; color: #fff !important; }
-[data-testid="stFileUploaderDropzoneInstructions"] { display: none; }
+  background: var(--red) !important; border: none !important; color: #fff !important;
+  border-radius: 12px !important; font-weight: 700 !important;
+  box-shadow: 0 8px 18px rgba(142, 27, 44, .22); }
 button[kind="primary"]:hover, [data-testid="stBaseButton-primary"]:hover {
-  background-color: #0b7258 !important; border-color: #0b7258 !important; }
+  background: var(--red-d) !important; }
+.stButton > button {
+  border-radius: 12px !important; border-color: #e4d9c8 !important; font-weight: 600; }
+[data-testid="stFileUploaderDropzone"] {
+  background: #fff !important; border: 2px dashed var(--red) !important; border-radius: 16px !important; }
+[data-testid="stFileUploaderDropzone"] button {
+  background: var(--ink) !important; color: #fff !important; border: none !important; border-radius: 10px !important; }
+[data-testid="stCameraInput"] {
+  background: #fff; border: 2px solid var(--red); border-radius: 16px; padding: 8px; }
+[data-testid="stTabs"] button[aria-selected="true"] {
+  color: var(--red) !important; border-bottom-color: var(--red) !important; font-weight: 800 !important; }
+[data-baseweb="input"] > div, [data-baseweb="textarea"] > div, [data-baseweb="select"] > div {
+  background: #fff !important; border-radius: 10px !important; }
+section[data-testid="stSidebar"] {
+  background: linear-gradient(180deg, #1a2744 0%, #12182b 100%); border-left: 3px solid var(--gold); }
+section[data-testid="stSidebar"] h1, section[data-testid="stSidebar"] h2, section[data-testid="stSidebar"] h3,
+section[data-testid="stSidebar"] label, section[data-testid="stSidebar"] p,
+section[data-testid="stSidebar"] .stCaption, section[data-testid="stSidebar"] span {
+  color: #f6f1e8 !important; }
+section[data-testid="stSidebar"] [data-testid="stMetricValue"],
+section[data-testid="stSidebar"] [data-testid="stMetricLabel"] { color: var(--gold) !important; }
+section[data-testid="stSidebar"] [data-baseweb="select"] span,
+section[data-testid="stSidebar"] [data-baseweb="input"] input,
+section[data-testid="stSidebar"] textarea {
+  color: #1c1917 !important;
+}
 [data-testid="stExpandSidebarButton"] svg, [data-testid="collapsedControl"] svg { fill: #fff !important; color: #fff !important; }
 [data-testid="stExpandSidebarButton"]::after, [data-testid="collapsedControl"]::after {
-  content: " المادة والمستوى والسجل"; font-size: 14px; font-weight: 700; margin-inline-start: 6px; }
+  content: " المادة والمستوى"; font-size: 14px; font-weight: 700; margin-inline-start: 6px; }
+div[data-testid="stVerticalBlockBorderWrapper"] {
+  background: #fff; border-radius: 16px !important; border-color: #eadfce !important; }
 </style>""", unsafe_allow_html=True)
 
 if "user" not in st.session_state:
@@ -2050,20 +2206,26 @@ if "user" not in st.session_state:
         st.rerun()
 
 if "user" not in st.session_state:
-    st.title("🎓 المساعد التربوي الذكي")
-    st.markdown("### حضّر جذاذاتك، ابنِ امتحاناتك، وصحّح أوراق تلاميذك بطريقتك أنت")
+    st.markdown(
+        """<div style="background:#1a2744;color:#f6f1e8;border-radius:20px;padding:28px 26px 22px;margin-bottom:18px">
+        <div style="color:#c4a35a;font-weight:700;letter-spacing:.04em;font-size:13px">من السابعة أساسي إلى البكالوريا · كل الاختصاصات</div>
+        <h1 style="color:#fff !important;margin:8px 0 6px;font-size:34px">مكتبك البيداغوجي</h1>
+        <p style="margin:0;font-size:18px;line-height:1.7">جذاذة بأسلوبك، فرض جاهز للطباعة، وسلّم إصلاح كما يكتبه أستاذ تونسي. الوقت الذي كان يذهب في التنسيق والتنقيط يبقى لك.</p>
+        </div>""",
+        unsafe_allow_html=True,
+    )
     c1, c2, c3 = st.columns(3)
-    c1.info("📄 **جذاذات**\n\nتحاور المساعد ثم تعدّل المسودة بالكلام")
-    c2.info("📝 **امتحانات**\n\nأجزاء ونقاط حسب طلبك، وورقة مؤطرة جاهزة للطباعة")
-    c3.info("🔍 **تصحيح**\n\nارفع صور الأوراق واحصل على العلامات وجدول Excel")
+    c1.info("**الجذاذة**\n\nتحاور، ثم تخرج ورقة تحمل اسمك ومؤسستك. تعدّلها بالكلام.")
+    c2.info("**الفرض وسلّمه**\n\nالأجزاء والنقاط التي تحددها، ومعها عناصر الإجابة نقطة بنقطة.")
+    c3.info("**تصحيح الأوراق**\n\nتفتح الكاميرا وتصور الورقة مباشرة، أو تختار أي صورة من هاتفك.")
     st.divider()
-    if st.button("🚀 ابدأ الآن مجاناً", type="primary", use_container_width=True):
+    if st.button("ادخل إلى مكتبك", type="primary", use_container_width=True):
         st.session_state.user = {"email": None, "owner": "guest:" + str(uuid.uuid4()), "display": "الأستاذ(ة)"}
         st.session_state["_tok"] = session_create(st.session_state.user)
         st.query_params["s"] = st.session_state["_tok"]
         st.rerun()
-    st.caption("بالضغط على «ابدأ» أو بدخولك ببريدك فأنت توافق على سياسة الخصوصية، وتتحمّل مسؤولية استعمال أسماء التلاميذ وفق ضوابط مؤسستك.")
-    st.markdown("**تريد حفظ ملفك وسجلك؟** ادخل ببريدك (بدون كلمة سر):")
+    st.caption("بالدخول أنت توافق على سياسة الخصوصية، وتبقى مسؤولاً عن استعمال أسماء تلاميذك وفق ضوابط مؤسستك.")
+    st.markdown("**بريدك يحفظ الجذاذات والفروض وجدول النقط. بلا كلمة سر.**")
     email_box("landing")
     with st.expander("🔒 سياسة الخصوصية والاستعمال"):
         st.markdown(PRIVACY_TEXT)
@@ -2173,13 +2335,14 @@ with st.sidebar:
 # =====================================================================
 # التبويبات
 # =====================================================================
-tab_profile, tab_lesson, tab_exam, tab_grader = st.tabs(["👤 ملفي", "📄 جذاذة", "📝 امتحان", "🔍 تصحيح الأوراق"])
+tab_profile, tab_lesson, tab_exam, tab_grader = st.tabs(["👤 ملفي", "📄 جذاذاتي", "📝 فروضي", "🔍 تصحيح الأوراق"])
+st.caption("اسمك ومؤسستك يظهران على الورقة. طريقتك في التحضير والتصحيح تُحترم كما كتبتها.")
 
 
 # ---------- ملفي (يُنفَّذ أولاً لتكون القيم محدّثة) ----------
 def profile_ui():
-    st.subheader("👤 ملفي البيداغوجي")
-    st.caption("املأه مرة واحدة. كل ما تكتبه هنا يُستعمل تلقائياً في الجذاذات والامتحانات.")
+    st.subheader("ملفي البيداغوجي")
+    st.caption("املأه مرة واحدة. اسمك ومؤسستك وطريقتك تُطبع على كل جذاذة وفرض من بعد.")
     c1, c2 = st.columns(2)
     c1.text_input("الاسم واللقب (يظهر في الوثائق)", key="pf_name")
     c2.text_input("المؤسسة", key="pf_school")
@@ -2213,9 +2376,10 @@ def profile_ui():
         st.text_area(label, key=f"pf_method_{kind}", height=140, placeholder=ph)
     st.text_area("ملاحظات خاصة (مؤسستي، منهاجي، تفضيلاتي...)", key="pf_notes", height=90)
 
-    with st.expander("✨ قلّدني: ارفع وثيقة سابقة لك ليتعلّم التطبيق أسلوبك"):
+    with st.expander("قلّد طريقتي: صوّر وثيقة سابقة أو اختر ملفها"):
         kind_label = st.radio("نوع الوثيقة", ["جذاذة", "امتحان"], horizontal=True, key="mimic_kind")
-        imgs = norm_files(st.file_uploader("صور أو ملف الوثيقة (صور، Word، Excel، PDF)", accept_multiple_files=True, key="mimic_files"), IMG_TYPES + DOC_TYPES)
+        _mimic_cam = st.checkbox("فتح الكاميرا", key="mimic_cam_on")
+        imgs = sources_box("mimic", camera=_mimic_cam, camera_label="📸 صوّر الوثيقة", file_label="📁 أو اخترها من الصور والملفات")
         if st.button("🔍 حلّل أسلوبي", key="mimic_go"):
             if not imgs:
                 st.warning("ارفع ملفاً واحداً على الأقل.")
@@ -2270,7 +2434,7 @@ with tab_lesson:
 with tab_exam:
     c_set, c_chat, c_prev = st.columns([1, 2, 2])
     with c_set:
-        st.markdown("#### ⚙️ إعدادات الفرض")
+        st.markdown("#### إعدادات الفرض")
         ex_type = st.selectbox("نوع الفرض", ["فرض مراقبة عدد 1", "فرض مراقبة عدد 2", "فرض تأليفي عدد 1", "فرض تأليفي عدد 2",
                                               "فرض تأليفي عدد 3", "فرض منزلي", "اختبار"], key="ex_type")
         ex_custom = st.text_input("عنوان مخصص (اختياري)", key="ex_custom")
@@ -2303,8 +2467,8 @@ with tab_grader:
             st.session_state.class_name = _gs.get("class_name", "")
             st.session_state.class_size = int(_gs.get("class_size", 0) or 0)
             st.session_state.absent_n = int(_gs.get("absent", 0) or 0)
-    st.subheader("🔍 تصحيح أوراق التلاميذ")
-    st.caption("اختر الامتحان، وأضف أوراق تلاميذك، وأنا أصحّح وأجهّز جدول النقط.")
+    st.subheader("تصحيح أوراق التلاميذ")
+    st.caption("صوّر الورقة من الكاميرا، أو اخترها من المعرض والملفات. العلامة تُحسب عنصراً بعنصر على سلّم الإصلاح، وأنت تعتمدها.")
     _top = st.container()
 
     def parse_roster(text, file):
@@ -2347,11 +2511,19 @@ with tab_grader:
         st.success(f"✓ البارم جاهز تلقائياً من امتحانك (العلامة القصوى {exam_total(draft):g}).")
     else:
         with st.container(border=True):
-            st.markdown("**ارفع الامتحان والبارم** (صور، Word، Excel، PDF)")
-            exam_files = norm_files(st.file_uploader("ورقة الامتحان", accept_multiple_files=True, key="exam_files"), IMG_TYPES + DOC_TYPES)
-            barem_text = st.text_area("البارم: اكتبه هنا", key="barem_text", height=90,
-                                      placeholder="مثال: س1 (4 ن): التعريف ... / س2 (6 ن): ...")
-            barem_file = norm_files(st.file_uploader("أو ارفع البارم", key="barem_file"), IMG_TYPES + DOC_TYPES)
+            st.markdown("**امتحان لم يُنشأ هنا** — صوّر الورقة أو اختر ملفها، ثم سلّم الإصلاح.")
+            c_ex, c_br = st.columns(2)
+            exam_files = sources_box(
+                "exam_src", camera=c_ex.checkbox("كاميرا الامتحان", key="exam_cam_on"),
+                camera_label="📸 صوّر ورقة الامتحان", file_label="📁 ملف الامتحان أو صوره",
+            )
+            barem_text = st.text_area("سلّم الإصلاح: اكتبه هنا إن كان قصيراً", key="barem_text", height=90,
+                                      placeholder="س1 (4 ن): التعريف (1) — المثال (1) — الربط (2)")
+            barem_files = sources_box(
+                "barem_src", multiple=False, camera=c_br.checkbox("كاميرا السلّم", key="barem_cam_on"),
+                camera_label="📸 صوّر سلّم الإصلاح", file_label="📁 ملف السلّم",
+            )
+            barem_file = barem_files[0] if barem_files else None
             _ek = (tuple((f.name, getattr(f, "size", 0)) for f in (exam_files or [])),
                    (barem_file.name, getattr(barem_file, "size", 0)) if barem_file else None)
             _ec = st.session_state.get("_exam_cache")
@@ -2383,7 +2555,7 @@ with tab_grader:
         st.markdown("**قائمة أسماء القسم (اختيارية)**")
         st.caption("ارفع ملف Excel/CSV فيه عمود الأسماء، أو الصق الأسماء (اسم في كل سطر).")
         rc1, rc2 = st.columns(2)
-        roster_file = norm_files(rc1.file_uploader("ملف القسم", key="roster_file"), ["xlsx", "xls", "csv"])
+        roster_file = norm_files(rc1.file_uploader("ملف القسم (Excel أو CSV، من أي مجلد)", key="roster_file"), ["xlsx", "xls", "csv"])
         roster_text = rc2.text_area("أو الصق الأسماء", key="roster_text", height=120)
         st.radio("كيف تُربط العلامات بالأسماء؟",
                  ["يقرأ المساعد الاسم من الورقة ويطابقه مع القائمة",
@@ -2414,7 +2586,11 @@ with tab_grader:
             st.caption(f"👇 {_t[2]}:")
             st.dataframe(pd.DataFrame(_t[4], columns=_t[3]), hide_index=True, use_container_width=True)
         grade_mode = "تلميذ بتلميذ (الأسهل)"
-        grading_instructions = st.text_area("شروط التصحيح وسلّم التنقيط", "صحّح الورقة بدقة وموضوعية دون تساهل، وأعطِ علامة مع ملاحظة بيداغوجية.", key="grading_text")
+        grading_instructions = st.text_area(
+            "شروط التصحيح",
+            "وزّع النقطة على عناصر الإجابة. اقبل المعنى الصحيح ولو اختلفت الصياغة. لا تعطِ العلامة كاملة إلا إذا حضرت كل العناصر. النقاط من مضاعفات 0.25.",
+            key="grading_text",
+        )
     _roster = st.session_state.get("roster") or []
     _by_order = bool(_roster) and str(st.session_state.get("roster_mode", "")).startswith("حسب")
     def apply_roster(d, idx, by_order=None):
@@ -2444,37 +2620,72 @@ with tab_grader:
     batch = not str(grade_mode).startswith("تلميذ")
     groups_in = []
     with _students:
-        st.caption("📱 صوّر الورقة بتطبيق الكاميرا (أو Google Drive Scan) ثم ارفعها هنا. لكل تلميذ بطاقة تتّسع لكل صفحاته.")
-        if True:
-            if "n_students" not in st.session_state:
-                st.session_state.n_students = 1
+        if "n_students" not in st.session_state:
+            st.session_state.n_students = 1
+        st.markdown("**صوّر ورقة التلميذ**")
+        st.caption("الكاميرا هنا تفتح مباشرة. لا تحفظ الصورة في ملف أولاً. صورة كل صفحة تُضاف إلى التلميذ الذي تختاره. للصفحة التالية اضغط ✕ ثم صوّر من جديد.")
+        _slots = int(st.session_state.n_students)
+        if class_size:
+            _slots = min(_slots, max(_left or 0, 0))
+        _slots = max(_slots, 0)
+        cam = st.camera_input("افتح الكاميرا", key="grade_live_cam")
+        if _slots:
+            dest = st.selectbox(
+                "تُضاف هذه الصورة إلى",
+                [f"التلميذ {i + 1}" for i in range(_slots)],
+                key="grade_cam_dest",
+            )
+        else:
+            dest = "التلميذ 1"
+        if cam is not None and _slots:
+            raw = cam.getvalue()
+            sid = _digest(raw) if raw else ""
+            dismissed = st.session_state.setdefault("_shot_dismiss_grade_live", set())
+            if sid and sid not in dismissed:
+                jpg = coerce_image(raw) or raw
+                bag = st.session_state.setdefault("grade_bag", {})
+                idx = int(str(dest).split()[-1]) - 1
+                slot = bag.setdefault(idx, [])
+                if sid not in {s for s, _ in slot}:
+                    slot.append((sid, jpg))
 
-            def _add_student():
-                st.session_state.n_students += 1
+        def _add_student():
+            st.session_state.n_students += 1
 
-            def _del_student():
-                st.session_state.n_students = max(1, st.session_state.n_students - 1)
+        def _del_student():
+            st.session_state.n_students = max(1, st.session_state.n_students - 1)
 
-            _slots = int(st.session_state.n_students)
-            if class_size:
-                _slots = min(_slots, _left)
-            for k in range(_slots):
-                with st.container(border=True):
-                    ca_, cb_ = st.columns([1, 2])
-                    if _roster:
-                        pick = ca_.selectbox(f"التلميذ {k + 1}", ["(يُقرأ الاسم من الورقة)"] + _roster, key=f"stu_name_{k}")
-                        nm = "" if str(pick).startswith("(") else pick
-                    else:
-                        nm = str(ca_.text_input(f"اسم التلميذ {k + 1} (اختياري)", key=f"stu_name_{k}")).strip()
-                    fs = norm_files(cb_.file_uploader("صور ورقته (كل الصفحات) أو ملف PDF", accept_multiple_files=True,
-                                                      key=f"stu_files_{k}"), IMG_TYPES + ["pdf"])
-                    _pg = expand_pages(list(fs)) if fs else []
-                    if _pg:
-                        groups_in.append((_pg, nm))
-            bc1, bc2, _sp = st.columns([1, 1, 3])
-            bc1.button("➕ تلميذ آخر", on_click=_add_student, key="add_stu",
-                       disabled=bool(class_size) and int(st.session_state.n_students) >= _left)
-            bc2.button("➖ حذف الأخير", on_click=_del_student, key="del_stu")
+        for k in range(_slots):
+            with st.container(border=True):
+                ca_, cb_ = st.columns([1, 2])
+                if _roster:
+                    pick = ca_.selectbox(f"التلميذ {k + 1}", ["(يُقرأ الاسم من الورقة)"] + _roster, key=f"stu_name_{k}")
+                    nm = "" if str(pick).startswith("(") else pick
+                else:
+                    nm = str(ca_.text_input(f"اسم التلميذ {k + 1} (اختياري)", key=f"stu_name_{k}")).strip()
+                shots = list(st.session_state.get("grade_bag", {}).get(k, []))
+                if shots:
+                    cb_.caption(f"{len(shots)} صورة من الكاميرا")
+                    scols = cb_.columns(min(len(shots), 3))
+                    for i, (sid, data) in enumerate(shots):
+                        scols[i % len(scols)].image(data, use_container_width=True)
+                        if scols[i % len(scols)].button("حذف", key=f"gdel_{k}_{sid}"):
+                            st.session_state.setdefault("_shot_dismiss_grade_live", set()).add(sid)
+                            st.session_state["grade_bag"][k] = [x for x in shots if x[0] != sid]
+                            st.rerun()
+                fs = norm_files(cb_.file_uploader(
+                    "أو اختر من المعرض والملفات",
+                    accept_multiple_files=True,
+                    key=f"stu_files_{k}",
+                ), IMG_TYPES + ["pdf"])
+                pages = [UpFile(f"cam_{k}_{sid}.jpg", data) for sid, data in shots]
+                pages.extend(expand_pages(list(fs)) if fs else [])
+                if pages:
+                    groups_in.append((pages, nm))
+        bc1, bc2, _sp = st.columns([1, 1, 3])
+        bc1.button("تلميذ آخر", on_click=_add_student, key="add_stu",
+                   disabled=bool(class_size) and int(st.session_state.n_students) >= (_left or 0))
+        bc2.button("حذف الأخير", on_click=_del_student, key="del_stu")
         if class_size and len(groups_in) > _left:
             st.warning(f"المتبقي في القسم {_left} تلميذ(ة) فقط؛ سيُعالج أول {_left} فقط.")
             groups_in = groups_in[:_left]
@@ -2490,7 +2701,7 @@ with tab_grader:
 
 
     with _btn:
-        _go = st.button("🚀 صحّح الأوراق", type="primary", key="grade_go", use_container_width=True)
+        _go = st.button("صحّح الأوراق", type="primary", key="grade_go", use_container_width=True)
 
     if _go:
         if not groups_in:
@@ -2514,15 +2725,16 @@ with tab_grader:
                 bar.progress((i - 1) / len(groups_in), text=f"تصحيح الورقة {i}/{len(groups_in)}: {nm or f.name}")
                 label = f"ورقة {i}" if (nm or (batch and _by_order)) else f.name
                 _gm = ("\nطريقة الأستاذ في التصحيح (التزم بها): " + prof("method_grading").strip()) if prof("method_grading").strip() else ""
-                system = f"""أنت أستاذ ومفتش تربوي تونسي خبير في المادة ({prof('subject')}) والمستوى ({grade_label()}).
-حلّل ورقة التلميذ المرفقة بدقة:
-1. اقرأ اسم التلميذ (إن لم يظهر فاكتب: {label}) وانسخ إجابته.
-2. حدّد النقاط القوية.
-3. رصد الأخطاء وصنّفها (لغوي/مفهومي/تطبيقي/منهجي) مع التصويب.
-4. أعطِ علامة حسب التعليمات التالية: ({instr}).{max_note}
-   سجّل في الحقل questions علامة كل سؤال على حدة (رقم السؤال، العلامة، العلامة القصوى، ملاحظة قصيرة){" بنفس ترتيب أسئلة سلّم الإصلاح وعلاماتها القصوى" if use_key and draft else " بعد تقسيم الورقة إلى أسئلة"}. كن موضوعياً ولا تتساهل. والعلامة الكلية هي مجموع علامات الأسئلة.
-5. اكتب ملاحظة بيداغوجية قصيرة وصادقة.
-قواعد التصحيح: صحّح كأستاذ صارم وعادل؛ لا تقرّب العلامة إلى الأعلى؛ لا تمنح العلامة كاملة إلا لإجابة صحيحة كاملة؛ اخصم على كل خطأ ولو جزئياً؛ لا تتأثر بجمال الخط أو طول الإجابة؛ إن تعذّرت قراءة جزء فاذكر ذلك في الملاحظة ولا تفترض صحته.{_gm}"""
+                system = f"""أنت أستاذ تونسي تصحّح فرضاً في مادة ({prof('subject')}) للمستوى ({grade_label()}). تصحّح كما يُصحَّح في القسم: على عناصر الإجابة، لا على الانطباع.
+حلّل ورقة التلميذ المرفقة:
+1. اقرأ اسم التلميذ (إن لم يظهر فاكتب: {label}) وانسخ إجابته كما هي.
+2. حدّد النقاط القوية في سطرين على الأكثر.
+3. اذكر كل خطأ مع تصويبه وصنّفه (لغوي/مفهومي/تطبيقي/منهجي). الخطأ اللغوي الذي لا يغيّر المعنى لا يُسقط العنصر العلمي.
+4. أعطِ العلامة حسب: ({instr}).{max_note}
+   في questions: سؤال بسؤال، بنفس ترتيب السلّم إن وُجد. score من مضاعفات 0.25 ولا تتجاوز max_score. في note اكتب ما أُعطي وما خُصم (مثال: التعريف 1/1، المثال 0.5/1).
+   العلامة الكلية = مجموع علامات الأسئلة بالضبط. لا تقرّبها إلى الأعلى.
+5. comment: جملة بيداغوجية واحدة صادقة، يذكر فيها أقوى عنصر وأوضح نقص.
+قواعد السلّم: تُقبل الصياغة المختلفة إذا أدّت معنى العنصر. لا تُمنح نقطة عنصر ناقص. الإجابة الفارغة = 0. إن تعذّرت قراءة موضع فاذكره في note ولا تفترض أنه صحيح. لا تتأثر بطول الإجابة ولا بجمال الخط.{_gm}"""
                 if len(grp) > 1:
                     system += f"\n\nملاحظة مهمة: الصور المرفقة ({len(grp)}) هي صفحات ورقة تلميذ واحد بالترتيب. اعتبرها ورقة واحدة وأعطِ نتيجة واحدة لها. الاسم يظهر عادة في الصفحة الأولى."
                 try:
